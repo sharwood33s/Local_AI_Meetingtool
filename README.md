@@ -1,3 +1,4 @@
+<img width="1112" height="944" alt="2D87872F-517F-4C62-83C5-BD3A7D7D38B5" src="https://github.com/user-attachments/assets/7f26a098-8aad-48ab-bb75-70cce28e73a9" />
 # Local AI Meetingtool
 
 Apple Silicon Mac 向けの、ローカル実行を前提にした文字起こし・話者分離・要約アプリです。
