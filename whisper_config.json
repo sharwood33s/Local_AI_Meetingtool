@@ -1,0 +1,8 @@
+{
+    "hf_token": "",
+    "model": "Turbo（高速・高精度）",
+    "diarize": true,
+    "num_speakers": "7",
+    "prompt": "",
+    "summary_prompt": "議事録（箇条書き）"
+}
