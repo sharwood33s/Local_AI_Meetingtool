@@ -13,6 +13,10 @@ import re
 import gc
 import torch
 import openai
+try:
+    import keyring
+except ImportError:
+    keyring = None
 from datetime import datetime #自動保存用のタイムスタンプ取得
 
 class CancelledError(Exception):
@@ -43,6 +47,8 @@ class Whisperapp:
         self.processing_thread = None
         self.cancel_event = threading.Event()
         self.active_task = None
+        self.keyring_service = "MLX Whisper Pro"
+        self.keyring_username = "huggingface_token"
         self.summary_timeout_seconds = 1800 #要約する際のタイムアウト時間
         self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
         self.transcript_text = ""
@@ -90,7 +96,7 @@ class Whisperapp:
         # Hugging Face トークン
         ctk.CTkLabel(self.configure_frame, text="Hugging Face トークン", font=self.font_main).grid(row=0, column=0, padx=15, pady=(10, 5), sticky="w")
         self.token_entry = ctk.CTkEntry(self.configure_frame, width=350, placeholder_text="Token (ローカル認証済なら不要)",
-                                         corner_radius=8, border_color="#D2D2D7", fg_color="#FFFFFF")
+                                         corner_radius=8, border_color="#D2D2D7", fg_color="#FFFFFF", show="*")
         self.token_entry.grid(row=0, column=1, padx=15, pady=(10, 5), sticky="w")
 
         # モデル選択
@@ -178,8 +184,8 @@ class Whisperapp:
 
     #コンフィグの保存
     def save_config(self):
+        self.save_hf_token()
         config = {
-            "hf_token": self.token_entry.get(),
             "model": self.model_var.get(),
             "diarize": self.diarize_var.get(),
             "num_speakers": self.num_speakers_var.get(),
@@ -192,15 +198,46 @@ class Whisperapp:
         except Exception:
             pass
 
+    def get_hf_token(self):
+        if keyring is None:
+            return None
+        try:
+            return keyring.get_password(self.keyring_service, self.keyring_username)
+        except Exception:
+            return None
+
+    def save_hf_token(self):
+        token = self.token_entry.get().strip()
+        if keyring is None:
+            if token:
+                messagebox.showwarning(
+                    "トークンを保存できません",
+                    "keyring パッケージが見つからないため、Hugging Faceトークンは安全に保存されません。\n"
+                    "requirements.txt を使って依存関係をインストールしてください。"
+                )
+            return False
+
+        try:
+            if token:
+                keyring.set_password(self.keyring_service, self.keyring_username, token)
+            else:
+                try:
+                    keyring.delete_password(self.keyring_service, self.keyring_username)
+                except keyring.errors.PasswordDeleteError:
+                    pass
+            return True
+        except Exception as e:
+            messagebox.showwarning("トークン保存エラー", f"Hugging Faceトークンを安全に保存できませんでした:\n{e}")
+            return False
+
     #コンフィグの読み込み
     def load_config(self):
+        config = {}
         if os.path.exists(self.config_filepath):
             try:
                 with open(self.config_filepath, "r", encoding="utf-8") as f:
                     config = json.load(f)
-                    
-                if "hf_token" in config and config["hf_token"]:
-                    self.token_entry.insert(0, config["hf_token"])
+
                 if "model" in config and config["model"] in self.models:
                     self.model_var.set(config["model"])
                 if "diarize" in config:
@@ -213,6 +250,15 @@ class Whisperapp:
                     self.summary_prompt_var.set(config["summary_prompt"])
             except Exception:
                 pass
+
+        stored_token = self.get_hf_token()
+        legacy_token = config.get("hf_token")
+        if stored_token:
+            self.token_entry.insert(0, stored_token)
+        elif legacy_token:
+            self.token_entry.insert(0, legacy_token)
+            if self.save_hf_token():
+                self.save_config()
 
     def on_closing(self):
         self.is_closing = True
@@ -337,6 +383,7 @@ class Whisperapp:
         self.cancel_btn.configure(state="normal")
         self.status_label.configure(text="処理しています…")
         self.progress.set(0)
+        self.save_config()
 
         task_config = {
             "filepath": self.filepath,
