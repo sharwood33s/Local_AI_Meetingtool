@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+.venv/
+venv/
+env/
+
+whisper_config.json
+.env
+.env.*
+
+*_transcript_*.txt
+*.log
+
+# Local draft notes
+README 2.md

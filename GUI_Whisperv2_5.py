@@ -78,7 +78,7 @@ class Whisperapp:
         # Hugging Face トークン
         ctk.CTkLabel(self.config_frame, text="Hugging Face トークン", font=self.font_main).grid(row=0, column=0, padx=15, pady=(10, 5), sticky="w")
         self.token_entry = ctk.CTkEntry(self.config_frame, width=350, placeholder_text="Token (optional)",
-                                         corner_radius=8, border_color="#D2D2D7", fg_color="#FFFFFF")
+                                         corner_radius=8, border_color="#D2D2D7", fg_color="#FFFFFF", show="*")
         self.token_entry.grid(row=0, column=1, padx=15, pady=(10, 5), sticky="w")
 
         # モデル選択
