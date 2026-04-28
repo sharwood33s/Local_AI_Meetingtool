@@ -1,4 +1,4 @@
-MLX Whisper Pro - 文字起こし & 要約アプリ
+Local AI Meetingtool 文字起こし & 要約アプリ
 Apple Silicon (M1/M2/M3) チップに最適化された、ローカル完結型の文字起こし・話者分離・要約アプリケーションです。
 mlx-whisper を使用することで、Mac上で高速かつ高精度な音声処理を実現します。
 v2が文字起こし話者分離機能。v2.5がv2にLMStidioに接続し、文章を要約する機能を追加したものです。
