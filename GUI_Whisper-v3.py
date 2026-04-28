@@ -30,7 +30,7 @@ ctk.set_default_color_theme("blue")
 class Whisperapp:
     def __init__(self, root):
         self.root = root
-        self.root.title("MLX Whisper Pro - 文字起こし & 要約")
+        self.root.title("Local AI MeetingTool Ver.3 - 文字起こし & 要約")
         self.root.geometry("1000x800")
         self.root.configure(fg_color="#FFFFFF")
         self.is_closing = False
@@ -45,7 +45,7 @@ class Whisperapp:
         self.cancel_event = threading.Event()
         self.active_task = None
         self.keyring = self.load_keyring()
-        self.keyring_service = "MLX Whisper Pro"
+        self.keyring_service = "Local AI MeetingTool Ver.3"
         self.keyring_username = "huggingface_token"
         self.summary_timeout_seconds = 1800 #要約する際のタイムアウト時間
         self.summary_chunk_chars = 4000 # 要約する文章を分割しLM Studioに渡す（メモリ節約のため小さく設定）
