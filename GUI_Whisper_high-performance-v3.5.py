@@ -13,10 +13,7 @@ import re
 import gc
 import torch
 import openai
-try:
-    import keyring
-except ImportError:
-    keyring = None
+import importlib
 from datetime import datetime #自動保存用のタイムスタンプ取得
 
 class CancelledError(Exception):
@@ -47,6 +44,7 @@ class Whisperapp:
         self.processing_thread = None
         self.cancel_event = threading.Event()
         self.active_task = None
+        self.keyring = self.load_keyring()
         self.keyring_service = "MLX Whisper Pro"
         self.keyring_username = "huggingface_token"
         self.summary_timeout_seconds = 1800 #要約する際のタイムアウト時間
@@ -199,16 +197,22 @@ class Whisperapp:
             pass
 
     def get_hf_token(self):
-        if keyring is None:
+        if self.keyring is None:
             return None
         try:
-            return keyring.get_password(self.keyring_service, self.keyring_username)
+            return self.keyring.get_password(self.keyring_service, self.keyring_username)
         except Exception:
+            return None
+
+    def load_keyring(self):
+        try:
+            return importlib.import_module("keyring")
+        except ImportError:
             return None
 
     def save_hf_token(self):
         token = self.token_entry.get().strip()
-        if keyring is None:
+        if self.keyring is None:
             if token:
                 messagebox.showwarning(
                     "トークンを保存できません",
@@ -219,11 +223,11 @@ class Whisperapp:
 
         try:
             if token:
-                keyring.set_password(self.keyring_service, self.keyring_username, token)
+                self.keyring.set_password(self.keyring_service, self.keyring_username, token)
             else:
                 try:
-                    keyring.delete_password(self.keyring_service, self.keyring_username)
-                except keyring.errors.PasswordDeleteError:
+                    self.keyring.delete_password(self.keyring_service, self.keyring_username)
+                except self.keyring.errors.PasswordDeleteError:
                     pass
             return True
         except Exception as e:
@@ -275,7 +279,7 @@ class Whisperapp:
             pass
 
     def has_result_text(self):
-        return bool(self.transcript_text.strip())
+        return bool(self.result_area.get("1.0", ctk.END).strip())
 
     def update_action_buttons(self):
         state = "normal" if self.has_result_text() else "disabled"
@@ -375,6 +379,7 @@ class Whisperapp:
         self.cancel_event = threading.Event()
         self.active_task = "transcribe"
         self.transcript_text = ""
+        self.result_area.delete("1.0", ctk.END)
         self.run_btn.configure(state="disabled")
         self.save_txt_btn.configure(state="disabled") 
         self.save_word_btn.configure(state="disabled")
@@ -500,7 +505,7 @@ class Whisperapp:
                         if hasattr(self.diarization_pipeline, "set_batch_size"):
                             self.diarization_pipeline.set_batch_size(128)
                     except Exception as e:
-                        raise RuntimeError(f"話者分離モデルの読み込みに失敗しました:")
+                        raise RuntimeError(f"話者分離モデルの読み込みに失敗しました:\n{e}")
 
                 def diarization_hook(*args, **kwargs):
                     if self.cancel_event.is_set():
@@ -557,7 +562,7 @@ class Whisperapp:
                     time_str = f"[{int(start_time//60):02d}:{int(start_time%60):02d}]"
                     final_text += f"【{speaker}】{time_str} {text}\n"
             
-             #話者分離を行わない場合は要約まmmn結果をそのまま返す
+            # 話者分離を行わない場合はWhisper結果をそのまま返す
             else:
                 final_text = whisper_result["text"].strip()
 
