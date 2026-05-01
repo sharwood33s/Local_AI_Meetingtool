@@ -13,5 +13,11 @@ whisper_config.json
 *_transcript_*.txt
 *.log
 
+# Legacy app versions kept locally
+GUI_Whisper-v3.py
+GUI_Whisper_high-performance-v3.py
+GUI_Whisper_high-performance-v3.5.py
+GUI_Whisperv2_5.py
+
 # Local draft notes
 README 2.md

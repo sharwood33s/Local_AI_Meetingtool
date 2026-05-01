@@ -47,7 +47,7 @@ class Whisperapp:
         self.keyring = self.load_keyring()
         self.keyring_service = "Local AI MeetingTool Pro Ver.3.5"
         self.keyring_username = "huggingface_token"
-        self.summary_timeout_seconds = 1800 #要約する際のタイムアウト時間
+        self.summary_timeout_seconds = 360 #要約する際のタイムアウト時間
         self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
         self.transcript_text = ""
 
