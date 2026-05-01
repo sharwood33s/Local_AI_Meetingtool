@@ -69,6 +69,7 @@ class Whisperapp:
             出力はMarkdown形式（README風）とし、適宜「#」などの見出し、箇条書き、手順のステップ分けを用いて、視覚的で読みやすく整理してください。
             出力には以下の項目を必ず含めてください：\n- 業務の目的・概要\n- 必要な前提知識・システム権限\n- 具体的な作業手順（ステップバイステップ）\n- 注意点・つまずきやすいポイント"""
         }
+        self.summary_modes = ["分割要約（長文向け）", "一括要約（短文向け）"]
 
         # --- メインレイアウト ---
         self.main_frame = ctk.CTkFrame(root, fg_color="transparent")
@@ -164,6 +165,10 @@ class Whisperapp:
                                                    variable=self.summary_prompt_var, corner_radius=8, width=280)
         self.summary_prompt_menu.pack(side=ctk.LEFT, padx=(15, 5))
 
+        self.summary_mode_var = ctk.StringVar(value="分割要約（長文向け）")
+        self.summary_mode_menu = ctk.CTkComboBox(self.action_frame, values=self.summary_modes, variable=self.summary_mode_var, corner_radius=8, width=160)
+        self.summary_mode_menu.pack(side=ctk.LEFT, padx=(0, 5))
+
         self.summarize_btn = ctk.CTkButton(self.action_frame, text="LM Studioで要約", command=self.start_summarize_thread, state="disabled", corner_radius=8, fg_color="#34C759", hover_color="#248A3D")
         self.summarize_btn.pack(side=ctk.LEFT, padx=(0, 5), expand=True, fill=ctk.X)
 
@@ -188,7 +193,8 @@ class Whisperapp:
             "diarize": self.diarize_var.get(),
             "num_speakers": self.num_speakers_var.get(),
             "prompt": self.prompt_entry.get(),
-            "summary_prompt": self.summary_prompt_var.get()
+            "summary_prompt": self.summary_prompt_var.get(),
+            "summary_mode": self.summary_mode_var.get()
         }
         try:
             with open(self.config_filepath, "w", encoding="utf-8") as f:
@@ -252,6 +258,8 @@ class Whisperapp:
                     self.prompt_entry.insert(0, config["prompt"])
                 if "summary_prompt" in config and config["summary_prompt"] in self.summary_prompts:
                     self.summary_prompt_var.set(config["summary_prompt"])
+                if "summary_mode" in config and config["summary_mode"] in self.summary_modes:
+                    self.summary_mode_var.set(config["summary_mode"])
             except Exception:
                 pass
 
@@ -296,7 +304,10 @@ class Whisperapp:
         if not keep_status:
             self.status_label.configure(text=status_text)
             
+        # ボタン群の有効化
+        self.select_btn.configure(state="normal")
         self.run_btn.configure(state="normal" if self.filepath else "disabled")
+        self.summary_mode_menu.configure(state="normal")
         self.summary_prompt_menu.configure(state="normal")
         self.update_action_buttons()
         self.cancel_btn.configure(state="disabled")
@@ -380,9 +391,11 @@ class Whisperapp:
         self.active_task = "transcribe"
         self.transcript_text = ""
         self.result_area.delete("1.0", ctk.END)
+        self.select_btn.configure(state="disabled")
         self.run_btn.configure(state="disabled")
         self.save_txt_btn.configure(state="disabled") 
         self.save_word_btn.configure(state="disabled")
+        self.summary_mode_menu.configure(state="disabled")
         self.summary_prompt_menu.configure(state="disabled")
         self.summarize_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
@@ -596,9 +609,12 @@ class Whisperapp:
             status_text = "完了しました / 自動保存に失敗しました"
             messagebox.showwarning("自動保存エラー", f"文字起こしは完了しましたが、自動保存に失敗しました:\n{str(e)}")
 
+        # ボタン群を有効化
         self.status_label.configure(text=status_text)
+        self.select_btn.configure(state="normal")
         self.run_btn.configure(state="normal")
         self.summary_prompt_menu.configure(state="normal")
+        self.summary_mode_menu.configure(state="normal")
         self.update_action_buttons()
         self.cancel_btn.configure(state="disabled")
         self.active_task = None
@@ -618,9 +634,11 @@ class Whisperapp:
         self.active_task = "summarize"
         
         #要約処理中はボタンを非アクティブ化
+        self.select_btn.configure(state="disabled")
         self.run_btn.configure(state="disabled") 
         self.summarize_btn.configure(state="disabled") 
         self.summary_prompt_menu.configure(state="disabled")
+        self.summary_mode_menu.configure(state="disabled")
         self.save_txt_btn.configure(state="disabled") 
         self.save_word_btn.configure(state="disabled") 
         self.cancel_btn.configure(state="normal")
@@ -630,16 +648,17 @@ class Whisperapp:
 
         selected_prompt_key = self.summary_prompt_var.get()
         system_prompt = self.summary_prompts.get(selected_prompt_key, self.summary_prompts["標準要約（事実のみ簡潔に）"])
+        summary_mode = self.summary_mode_var.get()
 
         self.processing_thread = threading.Thread(
             target=self.run_summarize_process,
-            args=(text_to_summarize, system_prompt),
+            args=(text_to_summarize, system_prompt, summary_mode),
         )
         self.processing_thread.daemon = True
         self.processing_thread.start()  
 
     #LM Studioと連携した要約処理の実行
-    def run_summarize_process(self, text, system_prompt):
+    def run_summarize_process(self, text, system_prompt, summary_mode):
         try:
             self.ensure_not_cancelled()
             client = openai.OpenAI(
@@ -656,6 +675,102 @@ class Whisperapp:
                     temperature=0.3
                 )
                 return response.choices[0].message.content.strip()
+
+            # 分割要約を階層的に再分割して統合
+            def make_summary_groups(summary_items, max_chars=None, max_items=6):
+                max_chars = max_chars or self.summary_chunk_chars
+                groups = []
+                current_group = []
+                current_length = 0
+
+                for summary_index, summary in enumerate(summary_items, start=1):
+                    parts = self.split_text_for_summary(summary.strip(), max_chars=max_chars)
+                    for part_index, part in enumerate(parts, start=1):
+                        label = f"要約 {summary_index}"
+                        if len(parts) > 1:
+                            label = f"{label}-{part_index}"
+                        item = f"【{label}】\n{part}"
+                        item_length = len(item) + 2
+
+                        should_start_next_group = (
+                            current_group and
+                            (current_length + item_length > max_chars or len(current_group) >= max_items)
+                        )
+                        if should_start_next_group:
+                            groups.append(current_group)
+                            current_group = []
+                            current_length = 0
+
+                        current_group.append(item)
+                        current_length += item_length
+
+                if current_group:
+                    groups.append(current_group)
+
+                return groups
+
+            def merge_summaries_hierarchically(summary_items):
+                current_summaries = [summary.strip() for summary in summary_items if summary.strip()]
+                if not current_summaries:
+                    raise ValueError("統合する要約がありません。")
+
+                level = 1
+                while len(current_summaries) > 1:
+                    self.ensure_not_cancelled()
+                    groups = make_summary_groups(current_summaries)
+                    next_summaries = []
+                    is_final_level = len(groups) == 1
+
+                    for group_index, group in enumerate(groups, start=1):
+                        self.ensure_not_cancelled()
+                        self.safe_after(
+                            lambda level=level, group_index=group_index, total=len(groups):
+                            self.status_label.configure(
+                                text=f"LM Studioで階層統合中... 第{level}階層 ({group_index}/{total})"
+                            )
+                        )
+                        merge_progress = min(0.95, 0.72 + (level - 1) * 0.06 + (group_index / len(groups)) * 0.05)
+                        self.safe_after(lambda merge_progress=merge_progress: self.progress.set(merge_progress))
+
+                        grouped_text = "\n\n".join(group)
+                        if is_final_level:
+                            instruction = (
+                                "以下は長い文字起こしを段階的に要約したものです。"
+                                "重複を整理し、重要な事実・決定事項・論点を落とさず、"
+                                "全体として一貫した最終要約に統合してください。\n\n"
+                            )
+                        else:
+                            instruction = (
+                                "以下は長い文字起こしを分割要約したものの一部です。"
+                                "次の統合段階で扱いやすい中間要約として、重複を整理し、"
+                                "重要な事実・決定事項・論点を落とさず統合してください。\n\n"
+                            )
+
+                        next_summaries.append(request_summary([
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"{instruction}{grouped_text}"}
+                        ]))
+
+                    current_summaries = next_summaries
+                    level += 1
+
+                return current_summaries[0]
+
+            # 一括要約
+            if summary_mode == "一括要約（短文向け）":
+                self.safe_after(lambda: self.status_label.configure(text="LM Studioで一括要約中..."))
+                self.safe_after(lambda: self.progress.set(0.2))
+                summary_result = request_summary([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": (
+                        "以下の文字起こしテキストを、指定された方針に沿って要約してください。\n\n"
+                        f"{text}"
+                    )}
+                ])
+                self.ensure_not_cancelled()
+                self.safe_after(lambda: self.progress.set(1.0))
+                self.safe_after(lambda: self.show_summary_result(summary_result))
+                return
             
             # 分割要約処理
             chunks = self.split_text_for_summary(text)
@@ -663,14 +778,14 @@ class Whisperapp:
                 raise ValueError("要約するテキストがありません。")
 
             summaries = []
-            total_steps = len(chunks) + (1 if len(chunks) > 1 else 0)
+            initial_progress_limit = 0.70
 
             for index, chunk in enumerate(chunks, start=1):
                 self.ensure_not_cancelled()
                 self.safe_after(lambda index=index, total=len(chunks): self.status_label.configure(
                     text=f"LM Studioで分割要約中... ({index}/{total})"
                 ))
-                self.safe_after(lambda index=index: self.progress.set((index - 1) / total_steps))
+                self.safe_after(lambda index=index: self.progress.set(((index - 1) / len(chunks)) * initial_progress_limit))
 
                 chunk_prompt = (
                     f"以下は長い文字起こしの一部です。全体の一部であることを前提に、"
@@ -688,19 +803,8 @@ class Whisperapp:
                 summary_result = summaries[0]
             else:
                 self.safe_after(lambda: self.status_label.configure(text="LM Studioで統合要約中..."))
-                self.safe_after(lambda: self.progress.set(len(chunks) / total_steps))
-                combined_text = "\n\n".join(
-                    f"【分割要約 {index}】\n{summary}"
-                    for index, summary in enumerate(summaries, start=1)
-                )
-                summary_result = request_summary([
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": (
-                        "以下は長い文字起こしを分割して要約したものです。"
-                        "重複を整理し、全体として一貫した最終要約に統合してください。\n\n"
-                        f"{combined_text}"
-                    )}
-                ])
+                self.safe_after(lambda: self.progress.set(initial_progress_limit))
+                summary_result = merge_summaries_hierarchically(summaries)
 
             self.safe_after(lambda: self.progress.set(1.0))
 

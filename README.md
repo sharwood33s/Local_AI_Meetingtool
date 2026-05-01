@@ -2,9 +2,9 @@
 # Local AI Meetingtool
 
 Apple Silicon Mac 向けの、ローカル実行を前提にした文字起こし・話者分離・要約アプリです。
-`GUI_Whisper-v3.py`はM2/16GB環境で動作確認をしたものです。
+`Local_AI_Meetingtool-v3.py`はM2/16GB環境で動作確認をしたものです。
 メモリ使用率が高い場合はモデルを小さいものに変更し使用してください。
-`GUI_Whisper_high-performance-v3.5.py`はM5Pro/48GB環境で動作を確認したものです。
+`Local_AI_Meetingtool_high-performance-v3.5.py`はM5Pro/48GB環境で動作を確認したものです。
 Large V3が安定動作するようにチューニングしています。
 メモリが不足する場合は、Turbo等に変更し使用してください。
 
@@ -48,7 +48,7 @@ python3.14 -m venv .venv
 ## Run
 
 ```bash
-.venv/bin/python GUI_Whisper_high-performance-v3.5.py
+.venv/bin/python Local_AI_Meetingtool_high-performance-v3.5.py
 ```
 
 ## Hugging Face
