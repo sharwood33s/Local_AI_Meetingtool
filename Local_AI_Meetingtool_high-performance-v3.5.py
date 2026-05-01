@@ -49,6 +49,13 @@ class Whisperapp:
         self.keyring_username = "huggingface_token"
         self.summary_timeout_seconds = 360 #要約する際のタイムアウト時間
         self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
+        self.summary_merge_chunk_chars = 6000 # 中間要約を統合する際の入力上限
+        self.summary_merge_group_items = 5 # 中間要約を一度に統合する最大件数
+        self.summary_intermediate_target_chars = 2500 # 階層統合中の中間要約目安
+        self.summary_final_target_chars = 7000 # 最終要約の目安
+        self.summary_intermediate_max_tokens = 2048
+        self.summary_final_max_tokens = 4096
+        self.summary_max_merge_levels = 8
         self.transcript_text = ""
 
 
@@ -668,17 +675,24 @@ class Whisperapp:
                 max_retries=0,
             )
 
-            def request_summary(messages):
+            def request_summary(messages, max_tokens=None):
+                request_params = {
+                    "model": "local-model",
+                    "messages": messages,
+                    "temperature": 0.3,
+                }
+                if max_tokens:
+                    request_params["max_tokens"] = max_tokens
+
                 response = client.chat.completions.create(
-                    model="local-model",
-                    messages=messages,
-                    temperature=0.3
+                    **request_params
                 )
                 return response.choices[0].message.content.strip()
 
             # 分割要約を階層的に再分割して統合
-            def make_summary_groups(summary_items, max_chars=None, max_items=6):
-                max_chars = max_chars or self.summary_chunk_chars
+            def make_summary_groups(summary_items, max_chars=None, max_items=None):
+                max_chars = max_chars or self.summary_merge_chunk_chars
+                max_items = max_items or self.summary_merge_group_items
                 groups = []
                 current_group = []
                 current_length = 0
@@ -709,6 +723,27 @@ class Whisperapp:
 
                 return groups
 
+            def compact_summary_if_needed(summary, target_chars, max_tokens, level, group_index):
+                summary = summary.strip()
+                if len(summary) <= target_chars:
+                    return summary
+
+                self.ensure_not_cancelled()
+                self.safe_after(
+                    lambda level=level, group_index=group_index:
+                    self.status_label.configure(
+                        text=f"長い要約を圧縮中... 第{level}階層 ({group_index})"
+                    )
+                )
+                return request_summary([
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": (
+                        f"以下の要約は長すぎます。重要な事実・決定事項・論点を残し、"
+                        f"重複と細部を削って、必ず{target_chars}字以内に圧縮してください。\n\n"
+                        f"{summary}"
+                    )}
+                ], max_tokens=max_tokens)
+
             def merge_summaries_hierarchically(summary_items):
                 current_summaries = [summary.strip() for summary in summary_items if summary.strip()]
                 if not current_summaries:
@@ -716,6 +751,12 @@ class Whisperapp:
 
                 level = 1
                 while len(current_summaries) > 1:
+                    if level > self.summary_max_merge_levels:
+                        raise RuntimeError(
+                            "中間要約が長すぎるため、階層統合が収束しませんでした。"
+                            "分割サイズや中間要約の目安文字数を小さくして再実行してください。"
+                        )
+
                     self.ensure_not_cancelled()
                     groups = make_summary_groups(current_summaries)
                     next_summaries = []
@@ -734,22 +775,36 @@ class Whisperapp:
 
                         grouped_text = "\n\n".join(group)
                         if is_final_level:
+                            target_chars = self.summary_final_target_chars
+                            max_tokens = self.summary_final_max_tokens
                             instruction = (
                                 "以下は長い文字起こしを段階的に要約したものです。"
                                 "重複を整理し、重要な事実・決定事項・論点を落とさず、"
-                                "全体として一貫した最終要約に統合してください。\n\n"
+                                f"全体として一貫した最終要約に統合してください。"
+                                f"出力は{target_chars}字以内を目安にしてください。\n\n"
                             )
                         else:
+                            target_chars = self.summary_intermediate_target_chars
+                            max_tokens = self.summary_intermediate_max_tokens
                             instruction = (
                                 "以下は長い文字起こしを分割要約したものの一部です。"
                                 "次の統合段階で扱いやすい中間要約として、重複を整理し、"
-                                "重要な事実・決定事項・論点を落とさず統合してください。\n\n"
+                                f"重要な事実・決定事項・論点を落とさず統合してください。"
+                                f"出力は必ず{target_chars}字以内にしてください。\n\n"
                             )
 
-                        next_summaries.append(request_summary([
+                        merged_summary = request_summary([
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": f"{instruction}{grouped_text}"}
-                        ]))
+                        ], max_tokens=max_tokens)
+                        merged_summary = compact_summary_if_needed(
+                            merged_summary,
+                            target_chars,
+                            max_tokens,
+                            level,
+                            group_index,
+                        )
+                        next_summaries.append(merged_summary)
 
                     current_summaries = next_summaries
                     level += 1
@@ -766,7 +821,7 @@ class Whisperapp:
                         "以下の文字起こしテキストを、指定された方針に沿って要約してください。\n\n"
                         f"{text}"
                     )}
-                ])
+                ], max_tokens=self.summary_final_max_tokens)
                 self.ensure_not_cancelled()
                 self.safe_after(lambda: self.progress.set(1.0))
                 self.safe_after(lambda: self.show_summary_result(summary_result))
@@ -789,13 +844,14 @@ class Whisperapp:
 
                 chunk_prompt = (
                     f"以下は長い文字起こしの一部です。全体の一部であることを前提に、"
-                    f"重要な事実・決定事項・論点を落とさず要約してください。\n\n"
+                    f"重要な事実・決定事項・論点を落とさず要約してください。"
+                    f"この段階の出力は必ず{self.summary_intermediate_target_chars}字以内にしてください。\n\n"
                     f"【分割 {index}/{len(chunks)}】\n\n{chunk}"
                 )
                 summaries.append(request_summary([
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": chunk_prompt}
-                ]))
+                ], max_tokens=self.summary_intermediate_max_tokens))
 
             self.ensure_not_cancelled()
 
