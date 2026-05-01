@@ -383,6 +383,101 @@ class Whisperapp:
 
         return [chunk for chunk in chunks if chunk]
 
+    # ユーザー辞書の設定
+    def parse_dictionary_text(self, dictionary_text, allow_csv_pairs=False):
+        replacements = {}
+        hint_words = []
+        invalid_entries = []
+
+        def add_mapping(wrong_text, correct_text=None, raw_entry=""):
+            wrong = wrong_text.strip()
+            correct = wrong if correct_text is None else correct_text.strip()
+            if not wrong or not correct: # 空の置換もとは事故につながるため明示的に弾く
+                entry = raw_entry.strip()
+                if entry:
+                    invalid_entries.append(entry)
+                return
+
+            if wrong not in replacements:
+                hint_words.append(wrong)
+            replacements[wrong] = correct
+
+        def split_mapping(entry):
+            for separator in ("=>", "->", "\t", ":", "："):
+                if separator in entry:
+                    wrong, correct = entry.split(separator, 1)
+                    return wrong, correct
+            return None, None
+
+        for line in dictionary_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # 明示的な対応表がある行は、カンマ等で複数ペアを書けるようにする
+            has_mapping_separator = any(separator in line for separator in ("=>", "->", "\t", ":", "："))
+            if has_mapping_separator:
+                entries = re.split(r"[、,，]", line)
+                for entry in entries:
+                    entry = entry.strip()
+                    if not entry:
+                        continue
+                    wrong, correct = split_mapping(entry)
+                    if wrong is None:
+                        add_mapping(entry)
+                    else:
+                        add_mapping(wrong, correct, entry)
+                continue
+
+            entries = [entry.strip() for entry in re.split(r"[、,，]", line) if entry.strip()]
+            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み児だけ2列を置換ペアにする
+            if allow_csv_pairs and len(entries) == 2:
+                add_mapping(entries[0], entries[1], line)
+            else:
+                for entry in entries:
+                    add_mapping(entry)
+
+        if invalid_entries:
+            preview = " / ".join(invalid_entries[:3])
+            raise ValueError(f"辞書入力に空の置換元または置換先があります: {preview}")
+
+        # 「AI」と『AI技術」のような重なりは、長い語を先にマッチさせる
+        sorted_replacements = dict(
+            sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True)
+        )
+        return sorted_replacements, hint_words
+
+    def build_initial_prompt(self, hint_words, max_chars=1200):
+        # Whisperの初期プロンプトが長くなりすぎないように先頭から一定量だけ渡す
+        selected_words = []
+        current_length = 0
+
+        for word in hint_words:
+            addition = len(word) + (2 if selected_words else 0)
+            if current_length + addition > max_chars:
+                break
+            selected_words.append(word)
+            current_length += addition
+
+        return ", ".join(selected_words) if selected_words else None
+
+    def build_dictionary_replacer(self, replacements):
+        if not replacements:
+            return lambda text: text
+        # セグメントごとに正規表現を組み立て直さないように置換関数を一度だけ作る
+        pattern = re.compile("|".join(re.escape(word) for word in replacements))
+        return lambda text: pattern.sub(lambda match: replacements[match.group(0)], text or "")
+
+    def format_dictionary_text(self, replacements, separator=", "):
+        # 読込・保存時の表記揺れをアプリないの標準形式に揃える
+        entries = []
+        for wrong, correct in replacements.items():
+            if wrong == correct:
+                entries.append(wrong)
+            else:
+                entries.append(f"{wrong}: {correct}")
+        return separator.join(entries)
+
     #実行ファイルフェーズ
     def select_file(self):
         file_types = [("Audio/Video files", "*.mp3 *.wav *.flac *.m4a *.mp4 *.mov *.mkv"), ("All files", "*.*")]
@@ -443,24 +538,8 @@ class Whisperapp:
                 
             self.ensure_not_cancelled()
 
-            prompt_dict = {}
-            hint_words = []
-            
-            if user_prompt:
-                for item in user_prompt.split(","):
-                    if ":" in item:
-                        wrong, correct = item.split(":", 1)
-                        prompt_dict[wrong.strip()] = correct.strip()
-                        hint_words.append(wrong.strip()) 
-                    else:
-                        word = item.strip()
-                        if word:
-                            prompt_dict[word] = word
-                            hint_words.append(word)
-
-                initial_prompt_str = ", ".join(hint_words) if hint_words else None
-            else:
-                initial_prompt_str = None
+            prompt_dict, hint_words = self.parse_dictionary_text(user_prompt)
+            initial_prompt_str = self.build_initial_prompt(hint_words)
 
             # 1.Whisperで文字起こし
             self.safe_after(lambda: self.status_label.configure(text="Whisperで文字起こし中... しばらくお待ちください..."))
@@ -494,17 +573,12 @@ class Whisperapp:
             self.safe_after(lambda: self.progress.set(0))
 
             #専門用語の置換
-            if prompt_dict: 
-                for segment in whisper_result["segments"]:
-                    text = segment["text"]
-                    for wrong, correct in prompt_dict.items():
-                        text = text.replace(wrong, correct) 
-                    segment["text"] = text
+            if prompt_dict:
+                replace_dictionary_terms = self.build_dictionary_replacer(prompt_dict)
+                for segment in whisper_result.get("segments", []):
+                    segment["text"] = replace_dictionary_terms(segment.get("text", ""))
 
-                full_text = whisper_result["text"]
-                for wrong, correct in prompt_dict.items():
-                    full_text = full_text.replace(wrong, correct)
-                whisper_result["text"] = full_text
+                whisper_result["text"] = replace_dictionary_terms(whisper_result.get("text", ""))
 
             final_text = ""
             gc.collect() 
@@ -935,8 +1009,13 @@ class Whisperapp:
                 with open(path, "r", encoding="utf-8") as f:
                     content = f.read().strip()
                 if content:
+                    replacements, _ = self.parse_dictionary_text(
+                        content,
+                        allow_csv_pairs=path.lower().endswith(".csv"),
+                    )
+                    normalized_content = self.format_dictionary_text(replacements)
                     self.prompt_entry.delete(0, ctk.END)
-                    self.prompt_entry.insert(0, content)
+                    self.prompt_entry.insert(0, normalized_content)
                     messagebox.showinfo("成功", f"辞書を読み込みました:\n{os.path.basename(path)}")
                 else:
                     messagebox.showinfo("確認", "選択したファイルは空でした。")
@@ -953,8 +1032,10 @@ class Whisperapp:
         path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text Files", "*.txt"), ("CSV Files", "*.csv")], title="辞書データを保存")
         if path:
             try:
+                replacements, _ = self.parse_dictionary_text(text)
+                normalized_text = self.format_dictionary_text(replacements, separator="\n")
                 with open(path, "w", encoding="utf-8") as f:
-                    f.write(text)
+                    f.write(normalized_text)
                 messagebox.showinfo("成功", f"辞書ファイルを保存しました:\n{os.path.basename(path)}")
             except Exception as e:
                 messagebox.showerror("エラー", f"辞書の保存に失敗しました:\n{str(e)}")
