@@ -48,7 +48,7 @@ class Whisperapp:
         self.cancel_event = threading.Event()
         self.active_task = None
         self.keyring = self.load_keyring()
-        self.keyring_service = "Local AI MeetingTool Ver.3"
+        self.keyring_service = "Local AI MeetingTool Ver.4"
         self.keyring_username = "huggingface_token"
         self.diarization_batch_size = 64 # M2チップ16GB向けの話者分離(pyannote)バッチサイズ
         self.context_length = 4000 # M2チップ16GB向けにLM Studioへ渡す1チャンクあたりの目安文字数
