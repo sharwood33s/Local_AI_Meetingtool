@@ -71,6 +71,20 @@ python3.14 -m venv .venv
 
 コード内の `api_key="lm-studio"` はLM Studio向けのダミー値です。実際のOpenAI APIキーではありません。
 
+## Performance Settings
+
+`whisper_config.json` で処理性能に関わる値を調整できます。
+
+```json
+{
+  "batch_size": 128,
+  "context_length": 8000
+}
+```
+
+- `batch_size`: 話者分離(pyannote)のバッチサイズです。メモリ不足時は小さくしてください。
+- `context_length`: 要約時にLM Studioへ渡す1チャンクあたりの目安文字数です。LM Studio本体のモデルコンテキスト長はLM Studio側でも設定してください。
+
 ## Local Files
 
 以下はローカル設定・生成物として扱い、Gitには含めません。

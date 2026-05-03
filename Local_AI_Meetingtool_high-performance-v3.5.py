@@ -47,6 +47,8 @@ class Whisperapp:
         self.keyring = self.load_keyring()
         self.keyring_service = "Local AI MeetingTool Pro Ver.3.5"
         self.keyring_username = "huggingface_token"
+        self.diarization_batch_size = 128 # 話者分離(pyannote)のバッチサイズ
+        self.context_length = 8000 # 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
         self.summary_timeout_seconds = 360 #要約する際のタイムアウト時間
         self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
         self.summary_merge_chunk_chars = 6000 # 中間要約を統合する際の入力上限
@@ -195,13 +197,20 @@ class Whisperapp:
     #コンフィグの保存
     def save_config(self):
         self.save_hf_token()
+        config = self.read_config_file()
+        # 古い設定ファイルに残っている可能性があるトークンは、再保存時にJSONから除外する
+        config.pop("hf_token", None)
         config = {
+            **config,
             "model": self.model_var.get(),
             "diarize": self.diarize_var.get(),
             "num_speakers": self.num_speakers_var.get(),
             "prompt": self.prompt_entry.get(),
             "summary_prompt": self.summary_prompt_var.get(),
-            "summary_mode": self.summary_mode_var.get()
+            "summary_mode": self.summary_mode_var.get(),
+            # 処理性能に関わる値は、画面項目ではなくwhisper_config.jsonから調整する
+            "batch_size": self.diarization_batch_size,
+            "context_length": self.context_length,
         }
         try:
             with open(self.config_filepath, "w", encoding="utf-8") as f:
@@ -248,27 +257,81 @@ class Whisperapp:
             return False
 
     #コンフィグの読み込み
-    def load_config(self):
-        config = {}
-        if os.path.exists(self.config_filepath):
-            try:
-                with open(self.config_filepath, "r", encoding="utf-8") as f:
-                    config = json.load(f)
+    def read_config_file(self):
+        # 設定ファイルが壊れていてもアプリ起動を止めず、デフォルト値で続行する
+        if not os.path.exists(self.config_filepath):
+            return {}
+        try:
+            with open(self.config_filepath, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            return config if isinstance(config, dict) else {}
+        except Exception:
+            return {}
 
-                if "model" in config and config["model"] in self.models:
-                    self.model_var.set(config["model"])
-                if "diarize" in config:
-                    self.diarize_var.set(config["diarize"])
-                if "num_speakers" in config:
-                    self.num_speakers_var.set(config["num_speakers"])
-                if "prompt" in config and config["prompt"]:
-                    self.prompt_entry.insert(0, config["prompt"])
-                if "summary_prompt" in config and config["summary_prompt"] in self.summary_prompts:
-                    self.summary_prompt_var.set(config["summary_prompt"])
-                if "summary_mode" in config and config["summary_mode"] in self.summary_modes:
-                    self.summary_mode_var.set(config["summary_mode"])
-            except Exception:
-                pass
+    def get_int_config(self, config, keys, default, min_value=1, max_value=None):
+        # 旧キー名も受け付けられるよう、候補キーを順番に見て最初の有効な整数を採用する
+        for key in keys:
+            if key not in config:
+                continue
+            raw_value = config.get(key)
+            try:
+                if isinstance(raw_value, bool):
+                    continue
+                value = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+
+            if value < min_value:
+                continue
+            if max_value is not None:
+                value = min(value, max_value)
+            return value
+        return default
+
+    def load_runtime_config(self, config=None):
+        # バッチサイズやコンテキスト長など、処理開始直前にも反映したい設定だけを読み込む
+        config = config if config is not None else self.read_config_file()
+
+        # batch_size: pyannoteの話者分離バッチサイズ。大きいほど速いがメモリを使う
+        self.diarization_batch_size = self.get_int_config(
+            config,
+            ("batch_size", "diarization_batch_size"),
+            self.diarization_batch_size,
+            min_value=1,
+            max_value=4096,
+        )
+
+        # context_length: 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
+        self.context_length = self.get_int_config(
+            config,
+            ("context_length", "summary_context_length", "summary_chunk_chars"),
+            self.context_length,
+            min_value=1000,
+            max_value=200000,
+        )
+        self.summary_chunk_chars = self.context_length
+        # 統合要約では入力に余白を残すため、通常チャンクより少し小さめにする
+        self.summary_merge_chunk_chars = max(1000, int(self.context_length * 0.75))
+
+    def load_config(self):
+        config = self.read_config_file()
+        self.load_runtime_config(config)
+
+        try:
+            if "model" in config and config["model"] in self.models:
+                self.model_var.set(config["model"])
+            if "diarize" in config:
+                self.diarize_var.set(config["diarize"])
+            if "num_speakers" in config:
+                self.num_speakers_var.set(config["num_speakers"])
+            if "prompt" in config and config["prompt"]:
+                self.prompt_entry.insert(0, config["prompt"])
+            if "summary_prompt" in config and config["summary_prompt"] in self.summary_prompts:
+                self.summary_prompt_var.set(config["summary_prompt"])
+            if "summary_mode" in config and config["summary_mode"] in self.summary_modes:
+                self.summary_mode_var.set(config["summary_mode"])
+        except Exception:
+            pass
 
         stored_token = self.get_hf_token()
         legacy_token = config.get("hf_token")
@@ -503,6 +566,8 @@ class Whisperapp:
         self.cancel_btn.configure(state="normal")
         self.status_label.configure(text="処理しています…")
         self.progress.set(0)
+        # アプリ起動後にJSONを書き換えた場合も、次の文字起こし実行で反映する
+        self.load_runtime_config()
         self.save_config()
 
         task_config = {
@@ -512,6 +577,7 @@ class Whisperapp:
             "do_diarize": self.diarize_var.get(),
             "num_speakers": self.num_speakers_var.get(),
             "user_prompt": self.prompt_entry.get().strip(),
+            "batch_size": self.diarization_batch_size,
         }
 
         self.processing_thread = threading.Thread(target=self.run_process, args=(task_config,))
@@ -596,10 +662,11 @@ class Whisperapp:
 
                         if torch.backends.mps.is_available() and hasattr(self.diarization_pipeline, "to"):
                             self.diarization_pipeline.to(torch.device("mps"))
-                        if hasattr(self.diarization_pipeline, "set_batch_size"):
-                            self.diarization_pipeline.set_batch_size(128)
                     except Exception as e:
                         raise RuntimeError(f"話者分離モデルの読み込みに失敗しました:\n{e}")
+                if hasattr(self.diarization_pipeline, "set_batch_size"):
+                    # 既にモデルを読み込み済みの場合でも、最新のJSON設定を毎回反映する
+                    self.diarization_pipeline.set_batch_size(task_config["batch_size"])
 
                 def diarization_hook(*args, **kwargs):
                     if self.cancel_event.is_set():
@@ -711,6 +778,9 @@ class Whisperapp:
             messagebox.showwarning("警告", "要約するテキストがありません。先に文字起こしを完了してください")
             return
 
+        # アプリ起動後にJSONを書き換えた場合も、次の要約実行でcontext_lengthを反映する
+        self.load_runtime_config()
+        self.save_config()
         self.cancel_event = threading.Event()
         self.active_task = "summarize"
         
