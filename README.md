@@ -2,9 +2,9 @@
 # Local AI Meetingtool
 
 Apple Silicon Mac 向けの、ローカル実行を前提にした文字起こし・話者分離・要約アプリです。
-`Local_AI_Meetingtool-v3.py`はM2/16GB環境で動作確認をしたものです。
+`Local_AI_Meetingtool-v4.py`はM2/16GB環境で動作確認をしたものです。
 メモリ使用率が高い場合はモデルを小さいものに変更し使用してください。
-`Local_AI_Meetingtool_high-performance-v3.5.py`はM5Pro/48GB環境で動作を確認したものです。
+`Local_AI_Meetingtool_Pro-v4.py`はM5Pro/48GB環境で動作を確認したものです。
 Large V3が安定動作するようにチューニングしています。
 メモリが不足する場合は、Turbo等に変更し使用してください。
 
