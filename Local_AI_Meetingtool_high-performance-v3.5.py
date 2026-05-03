@@ -21,13 +21,16 @@ class CancelledError(Exception):
 
 # --- 環境設定 ---
 os.environ["HF_HUB_OFFLINE"] = "0"
-from pyannote.audio import Pipeline
+# pyannoteは重いため、話者分離を使う場合だけ遅延ロードする
 
 # --- デザインの基本設定 ---
 ctk.set_appearance_mode("light") 
 ctk.set_default_color_theme("blue")
 
 class Whisperapp:
+    SUMMARY_HEADER = "=========================\n【要約結果】\n========================="
+    SUMMARY_SECTION_PATTERN = re.compile(r"\n\s*\n=+\n【要約結果】\n=+\n.*\Z", re.DOTALL)
+
     def __init__(self, root):
         self.root = root
         self.root.title("Local AI MeetingTool Pro Ver.3.5 - 文字起こし & 要約")
@@ -59,6 +62,7 @@ class Whisperapp:
         self.summary_final_max_tokens = 4096
         self.summary_max_merge_levels = 8
         self.transcript_text = ""
+        self.summary_text = ""
 
 
         self.models = {
@@ -232,6 +236,17 @@ class Whisperapp:
         except ImportError:
             return None
 
+    def load_diarization_pipeline_class(self):
+        # 話者分離OFFの通常利用ではpyannoteをロードしない
+        try:
+            pyannote_audio = importlib.import_module("pyannote.audio")
+            return pyannote_audio.Pipeline
+        except ImportError as e:
+            raise RuntimeError(
+                "話者分離を使うには pyannote-audio が必要です。"
+                "requirements.txt を使って依存関係をインストールしてください。"
+            ) from e
+
     def save_hf_token(self):
         token = self.token_entry.get().strip()
         if self.keyring is None:
@@ -401,6 +416,20 @@ class Whisperapp:
 
         return text
 
+    def strip_summary_section(self, text):
+        return self.SUMMARY_SECTION_PATTERN.sub("", text or "").strip()
+
+    def get_text_for_summary(self):
+        current_text = self.result_area.get("1.0", ctk.END).strip()
+        transcript_text = self.strip_summary_section(current_text)
+        if transcript_text:
+            self.transcript_text = transcript_text
+            return transcript_text
+        return self.transcript_text.strip()
+
+    def format_summary_section(self, summary):
+        return f"\n\n{self.SUMMARY_HEADER}\n{summary.strip()}\n"
+
     # 文字起こしが完了したらテキストファイルを自動保存
     def auto_save_text(self, text):
         if not self.filepath or not text.strip():
@@ -419,6 +448,12 @@ class Whisperapp:
     # 要約を行う文章を分割
     def split_text_for_summary(self, text, max_chars=None):
         max_chars = max_chars or self.summary_chunk_chars
+        text = (text or "").strip()
+        if not text:
+            return []
+        if len(text) <= max_chars:
+            return [text]
+
         lines = text.splitlines()
         chunks = []
         current_lines = []
@@ -658,6 +693,7 @@ class Whisperapp:
                 if self.diarization_pipeline is None:
                     auth_param = token if token else None
                     try:
+                        Pipeline = self.load_diarization_pipeline_class()
                         self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=auth_param)
 
                         if torch.backends.mps.is_available() and hasattr(self.diarization_pipeline, "to"):
@@ -749,6 +785,7 @@ class Whisperapp:
         self.progress.set(1.0) 
         self.result_area.insert(ctk.END, text)
         self.transcript_text = text
+        self.summary_text = ""
         try:
             auto_save_path = self.auto_save_text(text)
             status_text = f"完了しました / 自動保存: {os.path.basename(auto_save_path)}" if auto_save_path else "完了しました"
@@ -773,7 +810,7 @@ class Whisperapp:
 
     #要約処理の実行
     def start_summarize_thread(self): 
-        text_to_summarize = self.result_area.get("1.0", ctk.END).strip()
+        text_to_summarize = self.get_text_for_summary()
         if not text_to_summarize:
             messagebox.showwarning("警告", "要約するテキストがありません。先に文字起こしを完了してください")
             return
@@ -1030,8 +1067,15 @@ class Whisperapp:
 
     #要約結果をフォーマット
     def show_summary_result(self, summary): 
-        formatted_summary = f"\n \n=========================\n【要約結果】\n=========================\n{summary}\n\n" 
-        self.result_area.insert(ctk.END, formatted_summary) 
+        self.summary_text = summary.strip()
+        transcript_text = self.strip_summary_section(self.result_area.get("1.0", ctk.END))
+        if not transcript_text:
+            transcript_text = self.transcript_text.strip()
+        self.transcript_text = transcript_text
+
+        display_text = transcript_text + self.format_summary_section(self.summary_text)
+        self.result_area.delete("1.0", ctk.END)
+        self.result_area.insert(ctk.END, display_text)
         self.result_area.see(ctk.END) #スクロール
 
         self.reset_ui_after_task("要約が完了しました", keep_status=True)
