@@ -70,6 +70,7 @@ class Whisperapp:
         self.lm_studio_base_url = "http://localhost:1234/v1"
         self.lm_studio_api_key = "lm-studio"
         self.lm_studio_check_timeout_seconds = 5
+        self.privacy_mask_placeholder = "[個人情報]"
         self.transcript_text = ""
         self.summary_text = ""
 
@@ -199,6 +200,46 @@ class Whisperapp:
         )
         self.speaker_entry.pack(fill=ctk.X, pady=(0, 10))
 
+        # 5. 個人情報マスキング
+        self.privacy_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.privacy_frame.pack(fill=ctk.X, pady=(0, 5))
+
+        ctk.CTkLabel(self.privacy_frame, text="5. 個人情報マスキング（任意）",
+                     font=self.font_title, text_color="#1D1D1F").pack(side=ctk.LEFT)
+
+        self.privacy_mask_btn = ctk.CTkButton(
+            self.privacy_frame,
+            text="マスク実行",
+            command=self.apply_privacy_mask_from_ui,
+            state="disabled",
+            width=90,
+            height=28,
+            font=self.font_main,
+            fg_color="#F5F5F7",
+            text_color="#007AFF",
+            hover_color="#E5E5E7",
+        )
+        self.privacy_mask_btn.pack(side=ctk.RIGHT, padx=(5, 0))
+
+        self.privacy_mask_auto_var = ctk.BooleanVar(value=False)
+        self.privacy_mask_auto_check = ctk.CTkCheckBox(
+            self.privacy_frame,
+            text="結果を自動マスク",
+            variable=self.privacy_mask_auto_var,
+            font=self.font_main,
+        )
+        self.privacy_mask_auto_check.pack(side=ctk.RIGHT, padx=(5, 0))
+
+        self.privacy_mask_terms_entry = ctk.CTkEntry(
+            self.main_frame,
+            placeholder_text="マスク対象語句（例）山田太郎, 090-1234-5678, yamada@example.com",
+            corner_radius=8,
+            height=35,
+            border_color="#D2D2D7",
+            fg_color="#FFFFFF",
+        )
+        self.privacy_mask_terms_entry.pack(fill=ctk.X, pady=(0, 10))
+
         # 実行・キャンセルボタン群
         self.run_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
         self.run_frame.pack(fill=ctk.X, pady=5)
@@ -265,6 +306,8 @@ class Whisperapp:
             "num_speakers": self.num_speakers_var.get(),
             "prompt": self.prompt_entry.get(),
             "speaker_names": self.speaker_entry.get(),
+            "privacy_mask_auto": self.privacy_mask_auto_var.get(),
+            "privacy_mask_terms": self.privacy_mask_terms_entry.get(),
             "summary_prompt": self.summary_prompt_var.get(),
             "summary_mode": self.summary_mode_var.get(),
             # 処理性能に関わる値は、画面項目ではなくwhisper_config.jsonから調整する
@@ -398,6 +441,13 @@ class Whisperapp:
                 self.prompt_entry.insert(0, config["prompt"])
             if "speaker_names" in config and config["speaker_names"]:
                 self.speaker_entry.insert(0, config["speaker_names"])
+            if "privacy_mask_auto" in config:
+                privacy_mask_auto = config["privacy_mask_auto"]
+                if isinstance(privacy_mask_auto, str):
+                    privacy_mask_auto = privacy_mask_auto.lower() in ("1", "true", "yes", "on")
+                self.privacy_mask_auto_var.set(bool(privacy_mask_auto))
+            if "privacy_mask_terms" in config and config["privacy_mask_terms"]:
+                self.privacy_mask_terms_entry.insert(0, config["privacy_mask_terms"])
             if "summary_prompt" in config and config["summary_prompt"] in self.summary_prompts:
                 self.summary_prompt_var.set(config["summary_prompt"])
             if "summary_mode" in config and config["summary_mode"] in self.summary_modes:
@@ -439,6 +489,7 @@ class Whisperapp:
         self.summarize_btn.configure(state=state)
         self.extract_speaker_btn.configure(state=state)
         self.apply_speaker_btn.configure(state=state)
+        self.privacy_mask_btn.configure(state=state)
 
     def reset_ui_after_task(self, status_text, progress_value=0, keep_status=False):
         if self.progress.cget("mode") == "indeterminate":
@@ -781,6 +832,125 @@ class Whisperapp:
 
         return updated_text, updated_count
 
+    def parse_privacy_mask_terms(self, terms_text):
+        terms = []
+        seen = set()
+        for entry in re.split(r"[\n、,，]", terms_text or ""):
+            term = entry.strip()
+            if not term or term in seen:
+                continue
+            terms.append(term)
+            seen.add(term)
+        return sorted(terms, key=len, reverse=True)
+
+    def luhn_check(self, number_text):
+        digits = [int(char) for char in re.sub(r"\D", "", number_text)]
+        if len(digits) < 13 or len(digits) > 19:
+            return False
+
+        checksum = 0
+        parity = len(digits) % 2
+        for index, digit in enumerate(digits):
+            if index % 2 == parity:
+                digit *= 2
+                if digit > 9:
+                    digit -= 9
+            checksum += digit
+        return checksum % 10 == 0
+
+    def mask_privacy_text(self, text, custom_terms_text=None):
+        if not text:
+            return text, {}
+
+        masked_text = text
+        mask_counts = {}
+
+        def add_count(label, count):
+            if count:
+                mask_counts[label] = mask_counts.get(label, 0) + count
+
+        def replace_pattern(label, pattern, replacement, flags=0):
+            nonlocal masked_text
+            masked_text, count = re.subn(pattern, replacement, masked_text, flags=flags)
+            add_count(label, count)
+
+        sensitive_label_pattern = (
+            r"((?:氏名|名前|フルネーム|住所|所在地|生年月日|年齢|"
+            r"マイナンバー|個人番号|口座番号)\s*[:：]\s*)"
+            r"([^\n、。;,；]+)"
+        )
+        replace_pattern("ラベル付き個人情報", sensitive_label_pattern, rf"\1{self.privacy_mask_placeholder}")
+
+        replace_pattern(
+            "メールアドレス",
+            r"(?<![\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])",
+            "[メールアドレス]",
+        )
+        replace_pattern(
+            "郵便番号",
+            r"〒?\s*\d{3}[-ー－―−]\d{4}",
+            "[郵便番号]",
+        )
+        replace_pattern(
+            "電話番号",
+            r"(?<!\d)(?:0[789]0[-ー－―−]?\d{4}[-ー－―−]?\d{4}|0\d{1,4}[-ー－―−]?\d{1,4}[-ー－―−]?\d{3,4})(?!\d)",
+            "[電話番号]",
+        )
+
+        card_count = 0
+
+        def replace_card_number(match):
+            nonlocal card_count
+            candidate = match.group(0)
+            if self.luhn_check(candidate):
+                card_count += 1
+                return "[カード番号]"
+            return candidate
+
+        masked_text = re.sub(
+            r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)",
+            replace_card_number,
+            masked_text,
+        )
+        add_count("カード番号", card_count)
+
+        custom_terms = self.parse_privacy_mask_terms(
+            custom_terms_text if custom_terms_text is not None else self.privacy_mask_terms_entry.get()
+        )
+        for term in custom_terms:
+            masked_text, count = re.subn(re.escape(term), self.privacy_mask_placeholder, masked_text)
+            add_count("指定語句", count)
+
+        return masked_text, mask_counts
+
+    def format_mask_counts(self, mask_counts):
+        total = sum(mask_counts.values())
+        if total == 0:
+            return "0件"
+        details = " / ".join(f"{label}: {count}件" for label, count in mask_counts.items())
+        return f"{total}件 ({details})"
+
+    def apply_privacy_mask_from_ui(self):
+        text = self.result_area.get("1.0", ctk.END).strip()
+        if not text:
+            messagebox.showwarning("警告", "マスクするテキストがありません。")
+            return
+
+        masked_text, mask_counts = self.mask_privacy_text(text)
+        if masked_text == text:
+            messagebox.showinfo("確認", "検出できる個人情報はありませんでした。")
+            return
+
+        self.result_area.delete("1.0", ctk.END)
+        self.result_area.insert(ctk.END, masked_text)
+        self.sync_text_state_from_display()
+        self.save_config()
+        self.update_action_buttons()
+
+        count_text = self.format_mask_counts(mask_counts)
+        self.status_label.configure(text=f"個人情報をマスクしました ({count_text})")
+        messagebox.showinfo("成功", f"個人情報をマスクしました。\n{count_text}")
+
     def sync_text_state_from_display(self):
         display_text = self.result_area.get("1.0", ctk.END).strip()
         self.transcript_text = self.strip_summary_section(display_text)
@@ -862,6 +1032,7 @@ class Whisperapp:
         self.save_word_btn.configure(state="disabled")
         self.extract_speaker_btn.configure(state="disabled")
         self.apply_speaker_btn.configure(state="disabled")
+        self.privacy_mask_btn.configure(state="disabled")
         self.summary_mode_menu.configure(state="disabled")
         self.summary_prompt_menu.configure(state="disabled")
         self.summarize_btn.configure(state="disabled")
@@ -881,6 +1052,8 @@ class Whisperapp:
             "user_prompt": self.prompt_entry.get().strip(),
             "speaker_names": self.speaker_entry.get().strip(),
             "batch_size": self.diarization_batch_size,
+            "privacy_mask_auto": self.privacy_mask_auto_var.get(),
+            "privacy_mask_terms": self.privacy_mask_terms_entry.get().strip(),
         }
 
         self.processing_thread = threading.Thread(target=self.run_process, args=(task_config,))
@@ -1035,9 +1208,15 @@ class Whisperapp:
                 final_text = whisper_result["text"].strip()
 
             final_text = self.clean_repeated_text(final_text)
+            auto_mask_counts = None
+            if task_config["privacy_mask_auto"]:
+                final_text, auto_mask_counts = self.mask_privacy_text(
+                    final_text,
+                    task_config["privacy_mask_terms"],
+                )
 
             self.ensure_not_cancelled() #最終結果表示前にキャンセルされていないか確認
-            self.safe_after(lambda: self.show_result(final_text))
+            self.safe_after(lambda: self.show_result(final_text, auto_mask_counts))
 
         except CancelledError:
             self.cleanup_resources() #メモリ解放
@@ -1053,7 +1232,7 @@ class Whisperapp:
             self.safe_after(lambda: self.reset_ui_after_task("エラーが発生しました"))
 
     #結果表示
-    def show_result(self, text):
+    def show_result(self, text, auto_mask_counts=None):
         self.result_area.delete("1.0", ctk.END)
         self.progress.set(1.0) 
         self.result_area.insert(ctk.END, text)
@@ -1067,6 +1246,11 @@ class Whisperapp:
             status_text = "完了しました / 自動保存に失敗しました"
             messagebox.showwarning("自動保存エラー", f"文字起こしは完了しましたが、自動保存に失敗しました:\n{str(e)}")
 
+        mask_count_text = None
+        if auto_mask_counts is not None:
+            mask_count_text = self.format_mask_counts(auto_mask_counts)
+            status_text += f" / 個人情報マスク: {mask_count_text}"
+
         # ボタン群を有効化
         self.status_label.configure(text=status_text)
         self.select_btn.configure(state="normal")
@@ -1076,10 +1260,14 @@ class Whisperapp:
         self.update_action_buttons()
         self.cancel_btn.configure(state="disabled")
         self.active_task = None
+
+        success_message = "文字起こしが完了しました"
+        if mask_count_text is not None:
+            success_message += f"\n個人情報マスキング: {mask_count_text}"
         if auto_save_path:
-            messagebox.showinfo("成功", f"文字起こしが完了しました。\n自動保存しました:\n{os.path.basename(auto_save_path)}")
+            messagebox.showinfo("成功", f"{success_message}\n自動保存しました:\n{os.path.basename(auto_save_path)}")
         else:
-            messagebox.showinfo("成功", "文字起こしが完了しました")
+            messagebox.showinfo("成功", success_message)
 
     #要約処理の実行
     def start_summarize_thread(self): 
@@ -1087,6 +1275,15 @@ class Whisperapp:
         if not text_to_summarize:
             messagebox.showwarning("警告", "要約するテキストがありません。先に文字起こしを完了してください")
             return
+
+        if self.privacy_mask_auto_var.get():
+            display_text = self.result_area.get("1.0", ctk.END).strip()
+            masked_display_text, _ = self.mask_privacy_text(display_text)
+            if masked_display_text != display_text:
+                self.result_area.delete("1.0", ctk.END)
+                self.result_area.insert(ctk.END, masked_display_text)
+                self.sync_text_state_from_display()
+                text_to_summarize = self.get_text_for_summary()
 
         # アプリ起動後にJSONを書き換えた場合も、次の要約実行でcontext_lengthを反映する
         self.load_runtime_config()
@@ -1104,6 +1301,7 @@ class Whisperapp:
         self.save_word_btn.configure(state="disabled") 
         self.extract_speaker_btn.configure(state="disabled")
         self.apply_speaker_btn.configure(state="disabled")
+        self.privacy_mask_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         self.status_label.configure(text="LM Studioの起動確認中...") 
         self.progress.configure(mode="determinate")
@@ -1356,7 +1554,11 @@ class Whisperapp:
 
     #要約結果をフォーマット
     def show_summary_result(self, summary): 
-        self.summary_text = summary.strip()
+        summary_text = summary.strip()
+        if self.privacy_mask_auto_var.get():
+            summary_text, _ = self.mask_privacy_text(summary_text)
+
+        self.summary_text = summary_text
         transcript_text = self.strip_summary_section(self.result_area.get("1.0", ctk.END))
         if not transcript_text:
             transcript_text = self.transcript_text.strip()
