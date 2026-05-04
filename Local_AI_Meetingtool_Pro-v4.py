@@ -7,6 +7,7 @@ from tkinter import filedialog, messagebox
 import mlx_whisper
 import threading
 import os
+import logging
 import docx
 import json
 import re
@@ -16,7 +17,12 @@ import openai
 import importlib
 from datetime import datetime #自動保存用のタイムスタンプ取得
 
+logging.basicConfig(level=logging.INFO, filename='app.log', encoding='utf-8')
+
 class CancelledError(Exception):
+    pass
+
+class LMStudioConnectionError(Exception):
     pass
 
 # --- 環境設定 ---
@@ -61,6 +67,9 @@ class Whisperapp:
         self.summary_intermediate_max_tokens = 2048
         self.summary_final_max_tokens = 4096
         self.summary_max_merge_levels = 8
+        self.lm_studio_base_url = "http://localhost:1234/v1"
+        self.lm_studio_api_key = "lm-studio"
+        self.lm_studio_check_timeout_seconds = 5
         self.transcript_text = ""
         self.summary_text = ""
 
@@ -416,7 +425,8 @@ class Whisperapp:
             return
         try:
             self.root.after(0,callback)
-        except Exception:
+        except Exception as e:
+            logging.error(f"UI 更新エラー (safe_after): {e}")
             pass
 
     def has_result_text(self):
@@ -541,6 +551,44 @@ class Whisperapp:
             chunks.append("\n".join(current_lines).strip())
 
         return [chunk for chunk in chunks if chunk]
+
+    def check_lm_studio_running(self):
+        check_client = openai.OpenAI(
+            base_url=self.lm_studio_base_url,
+            api_key=self.lm_studio_api_key,
+            timeout=self.lm_studio_check_timeout_seconds,
+            max_retries=0,
+        )
+
+        try:
+            models = check_client.models.list()
+        except openai.APITimeoutError as e:
+            raise LMStudioConnectionError(
+                "LM Studio の起動確認がタイムアウトしました。\n"
+                "LM Studioを起動し、ローカルサーバーを開始してから再実行してください。\n"
+                f"接続先: {self.lm_studio_base_url}"
+            ) from e
+        except openai.APIConnectionError as e:
+            raise LMStudioConnectionError(
+                "LM Studio に接続できません。\n"
+                "LM Studioを起動し、ローカルサーバーを開始してから再実行してください。\n"
+                f"接続先: {self.lm_studio_base_url}"
+            ) from e
+        except openai.OpenAIError as e:
+            raise LMStudioConnectionError(
+                "LM Studio の起動確認に失敗しました。\n"
+                f"{str(e)}\n"
+                f"接続先: {self.lm_studio_base_url}"
+            ) from e
+
+        model_items = getattr(models, "data", None)
+        if model_items is not None and len(model_items) == 0:
+            raise LMStudioConnectionError(
+                "LM Studioには接続できましたが、利用可能なモデルが見つかりません。\n"
+                "LM Studioでモデルをロードしてから再実行してください。"
+            )
+
+        return True
 
     # ユーザー辞書の設定
     def parse_dictionary_text(self, dictionary_text, allow_csv_pairs=False):
@@ -845,6 +893,7 @@ class Whisperapp:
             self.status_label.configure(text="中止しています...")
             self.cancel_btn.configure(state="disabled")
             self.cancel_event.set()
+            self.cleanup_resources()
 
     #実行処理フェーズ
     def run_process(self, task_config):
@@ -991,12 +1040,14 @@ class Whisperapp:
             self.safe_after(lambda: self.show_result(final_text))
 
         except CancelledError:
+            self.cleanup_resources() #メモリ解放
             gc.collect()
             if torch.backends.mps.is_available(): torch.mps.empty_cache()
             self.safe_after(lambda: self.reset_ui_after_task("処理が中止されました"))
 
         #エラー表示
         except Exception as e:
+            self.cleanup_resources() #メモリ解放
             error_msg = f"処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("エラーが発生しました"))
@@ -1054,7 +1105,7 @@ class Whisperapp:
         self.extract_speaker_btn.configure(state="disabled")
         self.apply_speaker_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
-        self.status_label.configure(text="LM Studioで要約中...") 
+        self.status_label.configure(text="LM Studioの起動確認中...") 
         self.progress.configure(mode="determinate")
         self.progress.set(0)
 
@@ -1073,9 +1124,14 @@ class Whisperapp:
     def run_summarize_process(self, text, system_prompt, summary_mode):
         try:
             self.ensure_not_cancelled()
+            self.safe_after(lambda: self.status_label.configure(text="LM Studioの起動確認中..."))
+            self.check_lm_studio_running()
+            self.ensure_not_cancelled()
+            self.safe_after(lambda: self.status_label.configure(text="LM Studioで要約中..."))
+
             client = openai.OpenAI(
-                base_url="http://localhost:1234/v1",
-                api_key="lm-studio",
+                base_url=self.lm_studio_base_url,
+                api_key=self.lm_studio_api_key,
                 timeout=self.summary_timeout_seconds,
                 max_retries=0,
             )
@@ -1273,7 +1329,14 @@ class Whisperapp:
             self.safe_after(lambda: self.show_summary_result(summary_result))
 
         except CancelledError:
+            self.cleanup_resources()
             self.safe_after(lambda: self.reset_ui_after_task("要約処理が中止されました"))
+
+        except LMStudioConnectionError as e:
+            self.cleanup_resources()
+            error_msg = str(e)
+            self.safe_after(lambda: messagebox.showerror("LM Studio未起動", error_msg))
+            self.safe_after(lambda: self.reset_ui_after_task("LM Studioを確認してください"))
 
         except openai.APITimeoutError:
             error_msg = (
@@ -1282,9 +1345,11 @@ class Whisperapp:
             )
             self.safe_after(lambda: messagebox.showerror("タイムアウト", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約がタイムアウトしました"))
+            self.cleanup_resources()
 
 
         except Exception as e:
+            self.cleanup_resources()
             error_msg = f"要約処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約に失敗しました"))
