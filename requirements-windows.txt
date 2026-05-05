@@ -1,0 +1,17 @@
+# Windows用依存関係
+# mlx / mlx-whisper はApple Silicon専用のため含めません。
+#
+# インストール例:
+#   py -3.11 -m venv .venv
+#   .venv\Scripts\python -m pip install --upgrade pip
+#   .venv\Scripts\python -m pip install -r requirements-windows.txt
+
+customtkinter==5.2.2
+keyring==25.7.0
+faster-whisper==1.1.1
+openai==2.31.0
+pyannote-audio==4.0.4
+python-docx==1.2.0
+torch==2.11.0
+torchaudio==2.11.0
+torchcodec==0.11.0
