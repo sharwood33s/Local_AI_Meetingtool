@@ -1,54 +1,98 @@
-<img width="1112" height="944" alt="2D87872F-517F-4C62-83C5-BD3A7D7D38B5" src="https://github.com/user-attachments/assets/7f26a098-8aad-48ab-bb75-70cce28e73a9" />
+<img width="1112" height="944" alt="Local AI Meetingtool screenshot" src="https://github.com/user-attachments/assets/7f26a098-8aad-48ab-bb75-70cce28e73a9" />
+
 # Local AI Meetingtool
 
-Apple Silicon Mac 向けの、ローカル実行を前提にした文字起こし・話者分離・要約アプリです。
-`Local_AI_Meetingtool-v4.py`はM2/16GB環境で動作確認をしたものです。
-メモリ使用率が高い場合はモデルを小さいものに変更し使用してください。
-`Local_AI_Meetingtool_Pro-v4.py`はM5Pro/48GB環境で動作を確認したものです。
-Large V3が安定動作するようにチューニングしています。
-メモリが不足する場合は、Turbo等に変更し使用してください。
+ローカル実行を前提にした、音声・動画の文字起こし、話者分離、要約アプリです。
 
+macOS版はApple Silicon向けに `mlx-whisper` を使います。Windows版はWindows専用として `faster-whisper` を使います。要約はLM StudioまたはOllama CLIのローカルLLMを利用できます。
+
+## Versions
+
+- `Local_AI_Meetingtool_mac-v4.py`
+  - Apple Silicon Mac向けの通常版です。
+  - M2 / 16GB環境で動作確認しています。
+
+- `Local_AI_Meetingtool_Pro_mac-v4.5.py`
+  - Apple Silicon Mac向けのPro版です。
+  - M5 Pro / 48GB環境で動作確認しています。
+  - Large v3が安定動作するようにチューニングしています。
+
+- `Local_AI_Meetingtool_Pro_Windows-v4.5.py`
+  - Windows専用のPro版です。
+  - `faster-whisper` を使用します。
+  - 動作確認環境: AMD Ryzen 7 7800X3D / RAM 32GB / RTX 5070 Ti 16GB
 
 ## Features
 
-- `mlx-whisper` による日本語音声・動画の文字起こし
+- 日本語音声・動画の文字起こし
 - `pyannote-audio` による話者分離
-- LM Studio のOpenAI互換ローカルAPIを使った要約
+- LM StudioまたはOllama CLIを使ったローカルLLM要約
 - 専門用語・略語の登録
+- 話者名の置き換え
+- 個人情報のマスキング
 - テキスト形式とWord形式での保存
 - Hugging FaceトークンのOS資格情報ストア保存
 
 ## Requirements
 
+macOS版:
+
 - macOS
 - Apple Silicon Mac
 - Python 3.14
 - Homebrew
-- LM Studio
 - ffmpeg
+- LM Studio、またはOllama CLI
+- `requirements-mac.txt`
 
-Windowsは対象外です。
+Windows版:
+
+- Windows 10 / 11
+- Python 3.14
+- ffmpeg
+- LM Studio、またはOllama CLI
+- CUDA対応GPU推奨
+- `requirements-windows.txt`
 
 ## Setup
 
-Homebrewで、PythonのTkinterサポートとffmpegを入れます。
+macOS:
 
 ```bash
 brew install python-tk@3.14 ffmpeg
-```
-
-仮想環境を作成し、依存関係を入れます。
-
-```bash
 python3.14 -m venv .venv
 .venv/bin/python -m pip install --upgrade pip setuptools wheel
-.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements-mac.txt
 ```
+
+Windows:
+
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip setuptools wheel
+.\.venv\Scripts\python.exe -m pip install -r requirements-windows.txt
+```
+
+ffmpegは別途インストールし、`ffmpeg` コマンドをPATHから実行できる状態にしてください。
 
 ## Run
 
+macOS通常版:
+
 ```bash
-.venv/bin/python Local_AI_Meetingtool_high-performance-v3.5.py
+.venv/bin/python Local_AI_Meetingtool_mac-v4.py
+```
+
+macOS Pro版:
+
+```bash
+.venv/bin/python Local_AI_Meetingtool_Pro_mac-v4.5.py
+```
+
+Windows Pro版:
+
+```powershell
+.\.venv\Scripts\python.exe .\Local_AI_Meetingtool_Pro_Windows-v4.5.py
 ```
 
 ## Hugging Face
@@ -57,33 +101,57 @@ python3.14 -m venv .venv
 
 - `pyannote/speaker-diarization-3.1`
 
-トークンはアプリ画面に入力できます。入力したトークンは `whisper_config.json` には保存せず、`keyring` 経由でmacOS KeychainなどのOS資格情報ストアへ保存します。
+トークンはアプリ画面に入力できます。入力したトークンは設定JSONには保存せず、`keyring` 経由でOS資格情報ストアへ保存します。
 
-すでに `huggingface-cli login` などでローカル認証済みの場合は、トークン欄を空のままでも動作する場合があります。
+すでに `huggingface-cli login` などでローカル認証済みの場合は、トークン欄を空のままでも動作します。
+※トークン欄に何か入力されていると、トークンと誤認するので注意してください。
 
-## LM Studio
+## Summary Backends
 
-要約機能を使う場合は、LM Studioでローカルサーバーを起動してください。
+LM Studioを使う場合:
 
-- OpenAI互換API
-- URL: `http://localhost:1234/v1`
-- 要約用モデルをロード済み
+- LM Studioでローカルサーバーを起動してください。
+- OpenAI互換APIを有効にしてください。
+- URLは `http://localhost:1234/v1` です。
+- 要約用モデルをロードしてから実行してください。
 
-コード内の `api_key="lm-studio"` はLM Studio向けのダミー値です。実際のOpenAI APIキーではありません。
+Ollama CLIを使う場合:
 
-## Performance Settings
+- `ollama` コマンドをPATHから実行できる状態にしてください。
+- アプリからOllamaモデル名を指定できます。
+- Ollamaサーバーが未起動の場合、アプリが `ollama serve` の起動を試みます。
 
-`whisper_config.json` で処理性能に関わる値を調整できます。
+## Configuration
+
+設定ファイル:
+
+- macOS版設定: `whisper_config.json`
+- Windows版設定: `whisper_config_windows.json`
+
+Windows版では `whisper_config_windows.json` を使用します。処理性能に関わる値はこのファイルで調整できます。
+
+例:
 
 ```json
 {
-  "batch_size": 128,
-  "context_length": 8000
+  "batch_size": 192,
+  "context_length": 8000,
+  "windows_whisper_device": "cuda",
+  "windows_whisper_compute_type": "float16",
+  "windows_whisper_cpu_threads": 8,
+  "windows_whisper_num_workers": 1,
+  "windows_whisper_beam_size": 5,
+  "windows_whisper_best_of": 3,
+  "windows_whisper_batch_size": 16,
+  "windows_whisper_use_batched": true
 }
 ```
 
 - `batch_size`: 話者分離(pyannote)のバッチサイズです。メモリ不足時は小さくしてください。
-- `context_length`: 要約時にLM Studioへ渡す1チャンクあたりの目安文字数です。LM Studio本体のモデルコンテキスト長はLM Studio側でも設定してください。
+- `context_length`: 要約時にローカルLLMへ渡す1チャンクあたりの目安文字数です。
+- `windows_whisper_device`: `cuda` または `cpu` を指定します。
+- `windows_whisper_compute_type`: CUDA使用時の計算型です。
+- `windows_whisper_batch_size`: Windows版のbatched inferenceのバッチサイズです。
 
 ## Local Files
 
@@ -92,8 +160,12 @@ python3.14 -m venv .venv
 - `.venv/`
 - `__pycache__/`
 - `.DS_Store`
+- `app.log`
 - `whisper_config.json`
+- `whisper_config_windows.json`
 - `*_transcript_*.txt`
+- `*_summary_*.txt`
+- `*.docx`
 
 ## License
 
