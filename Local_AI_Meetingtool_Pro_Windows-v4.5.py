@@ -1,7 +1,7 @@
 #文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio使用）
 #使用時はLM Studioでローカルサーバーを起動し、llamaを使用すること
 #Windowsではfaster-whisperを使用して動作
-#M5 Pro 48GBに合わせた設定
+#7800X3D/RTX5070Ti-16GBに合わせた設定
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import threading
@@ -53,6 +53,8 @@ ctk.set_default_color_theme("blue")
 class Whisperapp:
     SUMMARY_HEADER = "=========================\n【要約結果】\n========================="
     SUMMARY_SECTION_PATTERN = re.compile(r"\n\s*\n=+\n【要約結果】\n=+\n.*\Z", re.DOTALL)
+    WINDOWS_UI_FONT = "Yu Gothic UI"
+    WINDOWS_TEXT_FONT = "MS Gothic"
 
     def __init__(self, root):
         self.root = root
@@ -64,9 +66,9 @@ class Whisperapp:
         self.is_closing = False
 
         # Windows標準フォントを使用
-        self.font_title = ("Yu Gothic UI", 15, "bold")
-        self.font_main = ("Yu Gothic UI", 13)
-        self.font_text = ("Consolas", 13)
+        self.font_title = (self.WINDOWS_UI_FONT, 15, "bold")
+        self.font_main = (self.WINDOWS_UI_FONT, 13)
+        self.font_text = (self.WINDOWS_TEXT_FONT, 13)
 
         self.diarization_pipeline = None
         self.processing_thread = None
