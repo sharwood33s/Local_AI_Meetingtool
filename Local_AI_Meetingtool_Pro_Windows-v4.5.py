@@ -33,6 +33,11 @@ try:
 except ImportError:
     WhisperModel = None
 
+try:
+    from faster_whisper import BatchedInferencePipeline
+except ImportError:
+    BatchedInferencePipeline = None
+
 class CancelledError(Exception):
     pass
 
@@ -79,7 +84,18 @@ class Whisperapp:
         self.keyring_service = "Local AI MeetingTool Pro Ver.4"
         self.keyring_username = "huggingface_token"
         self.diarization_batch_size = 128 # 話者分離(pyannote)のバッチサイズ
+        if platform.system() == "Windows":
+            self.diarization_batch_size = 192
         self.context_length = 8000 # 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
+        self.windows_whisper_device = "cuda"
+        self.windows_whisper_compute_type = "float16"
+        self.windows_whisper_cpu_threads = 8
+        self.windows_whisper_num_workers = 1
+        self.windows_whisper_beam_size = 5
+        self.windows_whisper_best_of = 3
+        self.windows_whisper_batch_size = 16
+        self.windows_whisper_use_batched = True
+        self.whisper_model_cache = {}
         self.summary_timeout_seconds = 360 #要約する際のタイムアウト時間
         self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
         self.summary_merge_chunk_chars = 6000 # 中間要約を統合する際の入力上限
@@ -372,6 +388,24 @@ class Whisperapp:
             return "mps"
         return "cpu"
 
+    def get_windows_whisper_device(self):
+        if self.windows_whisper_device == "cuda" and not torch.cuda.is_available():
+            return "cpu"
+        return self.windows_whisper_device
+
+    def get_cached_whisper_model(self, model_path, device, compute_type):
+        cache_key = (model_path, device, compute_type, self.windows_whisper_cpu_threads, self.windows_whisper_num_workers)
+        if cache_key not in self.whisper_model_cache:
+            self.whisper_model_cache.clear()
+            self.whisper_model_cache[cache_key] = WhisperModel(
+                model_path,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=self.windows_whisper_cpu_threads,
+                num_workers=self.windows_whisper_num_workers,
+            )
+        return self.whisper_model_cache[cache_key]
+
     def clear_torch_cache(self):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -398,14 +432,30 @@ class Whisperapp:
                 "requirements-windows.txt を使って依存関係をインストールしてください。"
             )
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
-        model = WhisperModel(model_path, device=device, compute_type=compute_type)
-        segments, info = model.transcribe(
-            filepath,
-            initial_prompt=initial_prompt or None,
-            **whisper_options,
-        )
+        device = self.get_windows_whisper_device()
+        compute_type = self.windows_whisper_compute_type if device == "cuda" else "int8"
+        model = self.get_cached_whisper_model(model_path, device, compute_type)
+
+        faster_whisper_options = dict(whisper_options)
+        if "logprob_threshold" in faster_whisper_options:
+            faster_whisper_options["log_prob_threshold"] = faster_whisper_options.pop("logprob_threshold")
+        faster_whisper_options["beam_size"] = self.windows_whisper_beam_size
+        faster_whisper_options["best_of"] = self.windows_whisper_best_of
+
+        if self.windows_whisper_use_batched and self.windows_whisper_batch_size > 1 and BatchedInferencePipeline is not None:
+            batched_model = BatchedInferencePipeline(model=model)
+            segments, info = batched_model.transcribe(
+                filepath,
+                batch_size=self.windows_whisper_batch_size,
+                initial_prompt=initial_prompt or None,
+                **faster_whisper_options,
+            )
+        else:
+            segments, info = model.transcribe(
+                filepath,
+                initial_prompt=initial_prompt or None,
+                **faster_whisper_options,
+            )
         segment_dicts = [
             {"start": segment.start, "end": segment.end, "text": segment.text}
             for segment in segments
@@ -450,6 +500,14 @@ class Whisperapp:
             "ollama_model": self.ollama_model_var.get().strip() or self.default_ollama_model,
             "config_platform": platform.system(),
             "config_file": self.config_filepath,
+            "windows_whisper_device": self.windows_whisper_device,
+            "windows_whisper_compute_type": self.windows_whisper_compute_type,
+            "windows_whisper_cpu_threads": self.windows_whisper_cpu_threads,
+            "windows_whisper_num_workers": self.windows_whisper_num_workers,
+            "windows_whisper_beam_size": self.windows_whisper_beam_size,
+            "windows_whisper_best_of": self.windows_whisper_best_of,
+            "windows_whisper_batch_size": self.windows_whisper_batch_size,
+            "windows_whisper_use_batched": self.windows_whisper_use_batched,
             # 処理性能に関わる値は、画面項目ではなくwhisper_config.jsonから調整する
             "batch_size": self.diarization_batch_size,
             "context_length": self.context_length,
@@ -546,6 +604,28 @@ class Whisperapp:
             return value
         return default
 
+    def get_bool_config(self, config, keys, default):
+        for key in keys:
+            if key not in config:
+                continue
+            raw_value = config.get(key)
+            if isinstance(raw_value, bool):
+                return raw_value
+            if isinstance(raw_value, str):
+                return raw_value.lower() in ("1", "true", "yes", "on")
+            if isinstance(raw_value, int):
+                return raw_value != 0
+        return default
+
+    def get_choice_config(self, config, keys, default, choices):
+        for key in keys:
+            if key not in config:
+                continue
+            value = str(config.get(key, "")).strip()
+            if value in choices:
+                return value
+        return default
+
     def load_runtime_config(self, config=None):
         # バッチサイズやコンテキスト長など、処理開始直前にも反映したい設定だけを読み込む
         config = config if config is not None else self.read_config_file()
@@ -570,6 +650,59 @@ class Whisperapp:
         self.summary_chunk_chars = self.context_length
         # 統合要約では入力に余白を残すため、通常チャンクより少し小さめにする
         self.summary_merge_chunk_chars = max(1000, int(self.context_length * 0.75))
+
+        self.windows_whisper_device = self.get_choice_config(
+            config,
+            ("windows_whisper_device", "whisper_device"),
+            self.windows_whisper_device,
+            ("cuda", "cpu"),
+        )
+        self.windows_whisper_compute_type = self.get_choice_config(
+            config,
+            ("windows_whisper_compute_type", "whisper_compute_type"),
+            self.windows_whisper_compute_type,
+            ("float16", "int8_float16", "int8"),
+        )
+        self.windows_whisper_cpu_threads = self.get_int_config(
+            config,
+            ("windows_whisper_cpu_threads", "whisper_cpu_threads"),
+            self.windows_whisper_cpu_threads,
+            min_value=1,
+            max_value=32,
+        )
+        self.windows_whisper_num_workers = self.get_int_config(
+            config,
+            ("windows_whisper_num_workers", "whisper_num_workers"),
+            self.windows_whisper_num_workers,
+            min_value=1,
+            max_value=4,
+        )
+        self.windows_whisper_beam_size = self.get_int_config(
+            config,
+            ("windows_whisper_beam_size", "whisper_beam_size"),
+            self.windows_whisper_beam_size,
+            min_value=1,
+            max_value=10,
+        )
+        self.windows_whisper_best_of = self.get_int_config(
+            config,
+            ("windows_whisper_best_of", "whisper_best_of"),
+            self.windows_whisper_best_of,
+            min_value=1,
+            max_value=10,
+        )
+        self.windows_whisper_batch_size = self.get_int_config(
+            config,
+            ("windows_whisper_batch_size", "whisper_batch_size"),
+            self.windows_whisper_batch_size,
+            min_value=1,
+            max_value=32,
+        )
+        self.windows_whisper_use_batched = self.get_bool_config(
+            config,
+            ("windows_whisper_use_batched", "whisper_use_batched"),
+            self.windows_whisper_use_batched,
+        )
 
     def load_config(self):
         config = self.read_config_file()
@@ -1336,6 +1469,10 @@ class Whisperapp:
             self.cleanup_resources()
 
     #実行処理フェーズ
+    def cleanup_resources(self):
+        gc.collect()
+        self.clear_torch_cache()
+
     def run_process(self, task_config):
         try:
             filepath = task_config["filepath"]
