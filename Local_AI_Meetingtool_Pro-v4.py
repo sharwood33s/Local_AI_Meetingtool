@@ -320,6 +320,7 @@ class Whisperapp:
         except Exception:
             pass
 
+    # HuggingFaceトークンの読み込み
     def get_hf_token(self):
         if self.keyring is None:
             return None
@@ -328,6 +329,7 @@ class Whisperapp:
         except Exception:
             return None
 
+    # KeyringからHuggingFaceトークンの読み込み
     def load_keyring(self):
         try:
             return importlib.import_module("keyring")
@@ -345,6 +347,7 @@ class Whisperapp:
                 "requirements.txt を使って依存関係をインストールしてください。"
             ) from e
 
+    # 入力されたトークンをkeyringに保存
     def save_hf_token(self):
         token = self.token_entry.get().strip()
         if self.keyring is None:
@@ -426,6 +429,7 @@ class Whisperapp:
         # 統合要約では入力に余白を残すため、通常チャンクより少し小さめにする
         self.summary_merge_chunk_chars = max(1000, int(self.context_length * 0.75))
 
+    # コンフィグのロード
     def load_config(self):
         config = self.read_config_file()
         self.load_runtime_config(config)
@@ -736,6 +740,7 @@ class Whisperapp:
                 entries.append(f"{wrong}: {correct}")
         return separator.join(entries)
 
+    # 発言者の指定
     def parse_speaker_name_text(self, speaker_text):
         mappings = {}
         invalid_entries = []
@@ -858,6 +863,7 @@ class Whisperapp:
             checksum += digit
         return checksum % 10 == 0
 
+    # 個人情報のマスキング処理
     def mask_privacy_text(self, text, custom_terms_text=None):
         if not text:
             return text, {}
@@ -1382,6 +1388,7 @@ class Whisperapp:
 
                 return groups
 
+            # 階層に分けて分割要約
             def compact_summary_if_needed(summary, target_chars, max_tokens, level, group_index):
                 summary = summary.strip()
                 if len(summary) <= target_chars:
