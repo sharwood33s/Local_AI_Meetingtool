@@ -7,6 +7,7 @@ venv/
 env/
 
 whisper_config.json
+whisper_config_windows.json
 .env
 .env.*
 
