@@ -325,7 +325,8 @@ class Whisperapp:
         self.progress.set(0)
 
         self.filepath = ""
-        self.config_filepath = "whisper_config.json"
+        self.legacy_config_filepath = "whisper_config.json"
+        self.config_filepath = "whisper_config_macos.json"
         
         self.load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -362,6 +363,8 @@ class Whisperapp:
             # 要約バックエンドとOllamaモデル名も次回起動時に復元する
             "summary_backend": self.get_summary_backend_name(),
             "ollama_model": self.ollama_model_var.get().strip() or self.default_ollama_model,
+            "config_platform": "macOS",
+            "config_file": self.config_filepath,
             # 処理性能に関わる値は、画面項目ではなくwhisper_config.jsonから調整する
             "batch_size": self.diarization_batch_size,
             "context_length": self.context_length,
@@ -424,10 +427,15 @@ class Whisperapp:
     #コンフィグの読み込み
     def read_config_file(self):
         # 設定ファイルが壊れていてもアプリ起動を止めず、デフォルト値で続行する
-        if not os.path.exists(self.config_filepath):
-            return {}
+        read_path = self.config_filepath
+        if not os.path.exists(read_path):
+            # OS別設定がまだ無い初回だけ、従来の共通設定を読み込む
+            if os.path.exists(self.legacy_config_filepath):
+                read_path = self.legacy_config_filepath
+            else:
+                return {}
         try:
-            with open(self.config_filepath, "r", encoding="utf-8") as f:
+            with open(read_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
             return config if isinstance(config, dict) else {}
         except Exception:
