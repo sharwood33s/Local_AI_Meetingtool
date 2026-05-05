@@ -14,7 +14,7 @@ import gc
 import torch
 import openai
 import importlib
-# Ollama CLI連携とmacOS/Windows別の起動処理で使用
+# Windows専用版のOS確認とOllama CLI連携で使用
 import platform
 import shutil
 import subprocess
@@ -22,11 +22,6 @@ import time
 from datetime import datetime #自動保存用のタイムスタンプ取得
 
 logging.basicConfig(level=logging.INFO, filename='app.log', encoding='utf-8')
-
-try:
-    import mlx_whisper
-except ImportError:
-    mlx_whisper = None
 
 try:
     from faster_whisper import WhisperModel
@@ -64,17 +59,14 @@ class Whisperapp:
         self.root.title("Local AI MeetingTool Pro Ver.4 - 文字起こし & 要約")
         self.root.geometry("1000x800")
         self.root.configure(fg_color="#FFFFFF")
+        if platform.system() != "Windows":
+            raise RuntimeError("Local_AI_Meetingtool_Pro_Windows-v4.5.py is Windows-only.")
         self.is_closing = False
 
-        # OSごとに存在しやすいフォントを選ぶ
-        if platform.system() == "Windows":
-            self.font_title = ("Yu Gothic UI", 15, "bold")
-            self.font_main = ("Yu Gothic UI", 13)
-            self.font_text = ("Consolas", 13)
-        else:
-            self.font_title = ("Hiragino Sans", 15, "bold")
-            self.font_main = ("Hiragino Sans", 13)
-            self.font_text = ("Menlo", 13)
+        # Windows標準フォントを使用
+        self.font_title = ("Yu Gothic UI", 15, "bold")
+        self.font_main = ("Yu Gothic UI", 13)
+        self.font_text = ("Consolas", 13)
 
         self.diarization_pipeline = None
         self.processing_thread = None
@@ -83,9 +75,7 @@ class Whisperapp:
         self.keyring = self.load_keyring()
         self.keyring_service = "Local AI MeetingTool Pro Ver.4"
         self.keyring_username = "huggingface_token"
-        self.diarization_batch_size = 128 # 話者分離(pyannote)のバッチサイズ
-        if platform.system() == "Windows":
-            self.diarization_batch_size = 192
+        self.diarization_batch_size = 192 # 話者分離(pyannote)のバッチサイズ
         self.context_length = 8000 # 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
         self.windows_whisper_device = "cuda"
         self.windows_whisper_compute_type = "float16"
@@ -350,29 +340,12 @@ class Whisperapp:
 
         self.filepath = ""
         self.legacy_config_filepath = "whisper_config.json"
-        self.config_filepath = self.get_config_filepath_for_current_os()
+        self.config_filepath = "whisper_config_windows.json"
         
         self.load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
-    def get_config_filepath_for_current_os(self):
-        os_name = platform.system()
-        if os_name == "Darwin":
-            return "whisper_config_macos.json"
-        if os_name == "Windows":
-            return "whisper_config_windows.json"
-        return "whisper_config_linux.json"
-
     def get_whisper_models(self):
-        if platform.system() == "Darwin":
-            return {
-               "Large v3（最高精度・低速）": "mlx-community/whisper-large-v3-mlx", 
-               "Turbo（高速・高精度）": "mlx-community/whisper-large-v3-turbo",
-                "Small（バランス）": "mlx-community/whisper-small-mlx",
-                "Base（軽量・高速）": "mlx-community/whisper-base-mlx",
-                "Tiny（最速・低精度）": "mlx-community/whisper-tiny-mlx"
-            }
-
         return {
            "Large v3（最高精度・低速）": "large-v3",
            "Turbo（高速・高精度）": "large-v3-turbo",
@@ -384,8 +357,6 @@ class Whisperapp:
     def get_torch_accelerator(self):
         if torch.cuda.is_available():
             return "cuda"
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            return "mps"
         return "cpu"
 
     def get_windows_whisper_device(self):
@@ -409,23 +380,8 @@ class Whisperapp:
     def clear_torch_cache(self):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            torch.mps.empty_cache()
 
     def transcribe_with_whisper(self, filepath, model_path, initial_prompt, whisper_options):
-        if platform.system() == "Darwin":
-            if mlx_whisper is None:
-                raise RuntimeError(
-                    "mlx-whisper がインストールされていません。\n"
-                    "macOSでは requirements.txt を使って mlx-whisper をインストールしてください。"
-                )
-            return mlx_whisper.transcribe(
-                filepath,
-                path_or_hf_repo=model_path,
-                initial_prompt=initial_prompt or None,
-                **whisper_options,
-            )
-
         if WhisperModel is None:
             raise RuntimeError(
                 "Windowsで文字起こしするには faster-whisper が必要です。\n"
@@ -498,7 +454,7 @@ class Whisperapp:
             # 要約バックエンドとOllamaモデル名も次回起動時に復元する
             "summary_backend": self.get_summary_backend_name(),
             "ollama_model": self.ollama_model_var.get().strip() or self.default_ollama_model,
-            "config_platform": platform.system(),
+            "config_platform": "Windows",
             "config_file": self.config_filepath,
             "windows_whisper_device": self.windows_whisper_device,
             "windows_whisper_compute_type": self.windows_whisper_compute_type,
@@ -938,17 +894,6 @@ class Whisperapp:
         )
 
     def start_ollama_server(self):
-        # macOSではOllama.appをバックグラウンド起動
-        if platform.system() == "Darwin" and shutil.which("open") is not None:
-            subprocess.Popen(
-                ["open", "-gja", "Ollama"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-            )
-            return
-
-        # macOS以外ではCLIサーバーを直接起動する
         creationflags = 0
         if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
             creationflags = subprocess.CREATE_NO_WINDOW
@@ -1506,7 +1451,7 @@ class Whisperapp:
                 "word_timestamps": False,               #タイムスタンプ計算のバグによる記号生成の抑止
                 "best_of": 3                            #5つの候補から最も適切なものを選択
             }
-            # macOSではmlx-whisper、Windows/Linuxではfaster-whisperで文字起こし
+            # Windows専用版ではfaster-whisperで文字起こし
             whisper_result = self.transcribe_with_whisper(
                 filepath,
                 model_path,
