@@ -58,7 +58,7 @@ class Whisperapp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Local AI MeetingTool Pro Ver.4 - 文字起こし & 要約")
+        self.root.title("Local AI MeetingTool Pro Ver.4.5 - 文字起こし & 要約")
         self.root.geometry("1200x1000")
         self.root.configure(fg_color="#FFFFFF")
         if platform.system() != "Windows":

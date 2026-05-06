@@ -1,13 +1,12 @@
-#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio使用）
-#使用時はLM Studioでローカルサーバーを起動し、llamaを使用すること
+#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio / Ollama CLI使用）
+#使用時はLM Studioでローカルサーバーを起動するか、Ollama CLIでモデルを用意すること
 #Windowsでは動作しないので注意
-#M5 Pro 48GBに合わせた設定
+#M2チップ16GBに合わせた設定（メモリ最適化済み）
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 import mlx_whisper
 import threading
 import os
-import logging
 import docx
 import json
 import re
@@ -15,14 +14,11 @@ import gc
 import torch
 import openai
 import importlib
-# Ollama CLI連携とmacOS/Windows別の起動処理で使用
 import platform
 import shutil
 import subprocess
 import time
 from datetime import datetime #自動保存用のタイムスタンプ取得
-
-logging.basicConfig(level=logging.INFO, filename='app.log', encoding='utf-8')
 
 class CancelledError(Exception):
     pass
@@ -47,7 +43,7 @@ class Whisperapp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Local AI MeetingTool Pro Ver.4.5 - 文字起こし & 要約")
+        self.root.title("Local AI MeetingTool Ver.4.5 - 文字起こし & 要約")
         self.root.geometry("1200x1000")
         self.root.configure(fg_color="#FFFFFF")
         self.is_closing = False
@@ -62,13 +58,13 @@ class Whisperapp:
         self.cancel_event = threading.Event()
         self.active_task = None
         self.keyring = self.load_keyring()
-        self.keyring_service = "Local AI MeetingTool Pro Ver.4"
+        self.keyring_service = "Local AI MeetingTool Ver.4"
         self.keyring_username = "huggingface_token"
-        self.diarization_batch_size = 128 # 話者分離(pyannote)のバッチサイズ
-        self.context_length = 8000 # 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
-        self.summary_timeout_seconds = 360 #要約する際のタイムアウト時間
-        self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
-        self.summary_merge_chunk_chars = 6000 # 中間要約を統合する際の入力上限
+        self.diarization_batch_size = 64 # M2チップ16GB向けの話者分離(pyannote)バッチサイズ
+        self.context_length = 4000 # M2チップ16GB向けにLM Studioへ渡す1チャンクあたりの目安文字数
+        self.summary_timeout_seconds = 1800 #要約する際のタイムアウト時間
+        self.summary_chunk_chars = 4000 # 要約する文章を分割しLM Studioに渡す（メモリ節約のため小さく設定）
+        self.summary_merge_chunk_chars = 3000 # 中間要約を統合する際の入力上限
         self.summary_merge_group_items = 5 # 中間要約を一度に統合する最大件数
         self.summary_intermediate_target_chars = 2500 # 階層統合中の中間要約目安
         self.summary_final_target_chars = 7000 # 最終要約の目安
@@ -77,7 +73,7 @@ class Whisperapp:
         self.summary_max_merge_levels = 8
         self.lm_studio_base_url = "http://localhost:1234/v1"
         self.lm_studio_api_key = "lm-studio"
-        self.lm_studio_check_timeout_seconds = 5
+        self.lm_studio_check_timeout_seconds = 5 # 起動確認だけなのでM2でも負荷をかけない
         # 要約バックエンドは従来のLM Studioに加えてOllama CLIを選択可能
         self.summary_backends = ["LM Studio", "Ollama CLI"]
         self.default_summary_backend = "LM Studio"
@@ -137,7 +133,7 @@ class Whisperapp:
 
         # モデル選択
         ctk.CTkLabel(self.configure_frame, text="使用するAIモデル", font=self.font_main).grid(row=1, column=0, padx=15, pady=5, sticky="w")
-        self.model_var = ctk.StringVar(value="Large v3（最高精度・低速）")
+        self.model_var = ctk.StringVar(value="Turbo（高速・高精度）")  # M2チップ16GB向けのデフォルト
         self.model_menu = ctk.CTkComboBox(self.configure_frame, values=list(self.models.keys()), 
                                           variable=self.model_var, width=350, corner_radius=8)
         self.model_menu.grid(row=1, column=1, padx=15, pady=5, sticky="w")
@@ -325,8 +321,7 @@ class Whisperapp:
         self.progress.set(0)
 
         self.filepath = ""
-        self.legacy_config_filepath = "whisper_config.json"
-        self.config_filepath = "whisper_config_macos.json"
+        self.config_filepath = "whisper_config.json"
         
         self.load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -363,8 +358,6 @@ class Whisperapp:
             # 要約バックエンドとOllamaモデル名も次回起動時に復元する
             "summary_backend": self.get_summary_backend_name(),
             "ollama_model": self.ollama_model_var.get().strip() or self.default_ollama_model,
-            "config_platform": "macOS",
-            "config_file": self.config_filepath,
             # 処理性能に関わる値は、画面項目ではなくwhisper_config.jsonから調整する
             "batch_size": self.diarization_batch_size,
             "context_length": self.context_length,
@@ -427,15 +420,10 @@ class Whisperapp:
     #コンフィグの読み込み
     def read_config_file(self):
         # 設定ファイルが壊れていてもアプリ起動を止めず、デフォルト値で続行する
-        read_path = self.config_filepath
-        if not os.path.exists(read_path):
-            # OS別設定がまだ無い初回だけ、従来の共通設定を読み込む
-            if os.path.exists(self.legacy_config_filepath):
-                read_path = self.legacy_config_filepath
-            else:
-                return {}
+        if not os.path.exists(self.config_filepath):
+            return {}
         try:
-            with open(read_path, "r", encoding="utf-8") as f:
+            with open(self.config_filepath, "r", encoding="utf-8") as f:
                 config = json.load(f)
             return config if isinstance(config, dict) else {}
         except Exception:
@@ -471,7 +459,7 @@ class Whisperapp:
             ("batch_size", "diarization_batch_size"),
             self.diarization_batch_size,
             min_value=1,
-            max_value=4096,
+            max_value=64,
         )
 
         # context_length: 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
@@ -480,7 +468,7 @@ class Whisperapp:
             ("context_length", "summary_context_length", "summary_chunk_chars"),
             self.context_length,
             min_value=1000,
-            max_value=200000,
+            max_value=4000,
         )
         self.summary_chunk_chars = self.context_length
         # 統合要約では入力に余白を残すため、通常チャンクより少し小さめにする
@@ -540,8 +528,7 @@ class Whisperapp:
             return
         try:
             self.root.after(0,callback)
-        except Exception as e:
-            logging.error(f"UI 更新エラー (safe_after): {e}")
+        except Exception:
             pass
 
     def has_result_text(self):
@@ -753,7 +740,7 @@ class Whisperapp:
 
         try:
             result = self.run_ollama_list()
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired:
             result = None
         except OSError as e:
             raise OllamaConnectionError(
@@ -868,7 +855,7 @@ class Whisperapp:
                 continue
 
             entries = [entry.strip() for entry in re.split(r"[、,，]", line) if entry.strip()]
-            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み児だけ2列を置換ペアにする
+            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み時だけ2列を置換ペアにする
             if allow_csv_pairs and len(entries) == 2:
                 add_mapping(entries[0], entries[1], line)
             else:
@@ -1248,7 +1235,6 @@ class Whisperapp:
             self.status_label.configure(text="中止しています...")
             self.cancel_btn.configure(state="disabled")
             self.cancel_event.set()
-            self.cleanup_resources()
 
     #実行処理フェーズ
     def run_process(self, task_config):
@@ -1273,7 +1259,7 @@ class Whisperapp:
             self.safe_after(lambda: self.progress.start())
             model_path = self.models[task_config["model_label"]]
 
-            #長時間データの場合の安定化オプション
+            #長時間データの場合の安定化オプション（M2チップ16GB向けにメモリ節約設定）
             whisper_options = {
                 "language": "ja",                       #言語を日本語に固定
                 "condition_on_previous_text": False,   #前の文脈を引きずらない
@@ -1282,7 +1268,7 @@ class Whisperapp:
                 "logprob_threshold": -0.8,              #無音区間の暴走抑止
                 "temperature": 0.0,                      #ランダムな記号の生成抑止
                 "word_timestamps": False,               #タイムスタンプ計算のバグによる記号生成の抑止
-                "best_of": 3                            #5つの候補から最も適切なものを選択
+                "best_of": 1                            #メモリ節約のため候補数を1に設定
             }
             # Whisperで文字起こし
             whisper_result = mlx_whisper.transcribe(
@@ -1309,7 +1295,7 @@ class Whisperapp:
             final_text = ""
             gc.collect() 
             if torch.backends.mps.is_available():
-                torch.mps.empty_cache() 
+                torch.mps.empty_cache()  # M2チップ向けにメモリクリアを強化
 
             # 2.話者分離の実行
             if do_diarize:
@@ -1397,18 +1383,20 @@ class Whisperapp:
                     task_config["privacy_mask_terms"],
                 )
 
+            gc.collect()  # メモリクリアを追加
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
             self.ensure_not_cancelled() #最終結果表示前にキャンセルされていないか確認
             self.safe_after(lambda: self.show_result(final_text, auto_mask_counts))
 
         except CancelledError:
-            self.cleanup_resources() #メモリ解放
             gc.collect()
             if torch.backends.mps.is_available(): torch.mps.empty_cache()
             self.safe_after(lambda: self.reset_ui_after_task("処理が中止されました"))
 
         #エラー表示
         except Exception as e:
-            self.cleanup_resources() #メモリ解放
             error_msg = f"処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("エラーが発生しました"))
@@ -1492,7 +1480,7 @@ class Whisperapp:
         summary_backend = self.get_summary_backend_name()
         ollama_model = self.ollama_model_var.get().strip() or self.default_ollama_model
         # 選択されたバックエンドをワーカースレッドへ渡して要約処理内で分岐する
-        self.status_label.configure(text=f"{summary_backend}の起動確認中...") 
+        self.status_label.configure(text=f"{summary_backend}の起動確認中...")
         self.progress.configure(mode="determinate")
         self.progress.set(0)
 
@@ -1507,7 +1495,7 @@ class Whisperapp:
         self.processing_thread.daemon = True
         self.processing_thread.start()  
 
-    #LM Studioと連携した要約処理の実行
+    #LM Studio / Ollama CLIと連携した要約処理の実行
     def run_summarize_process(self, text, system_prompt, summary_mode, summary_backend, ollama_model):
         try:
             self.ensure_not_cancelled()
@@ -1753,17 +1741,14 @@ class Whisperapp:
             self.safe_after(lambda: self.show_summary_result(summary_result))
 
         except CancelledError:
-            self.cleanup_resources()
             self.safe_after(lambda: self.reset_ui_after_task("要約処理が中止されました"))
 
         except LMStudioConnectionError as e:
-            self.cleanup_resources()
             error_msg = str(e)
             self.safe_after(lambda: messagebox.showerror("LM Studio未起動", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("LM Studioを確認してください"))
 
         except OllamaConnectionError as e:
-            self.cleanup_resources()
             error_msg = str(e)
             self.safe_after(lambda: messagebox.showerror("Ollama CLIエラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("Ollama CLIを確認してください"))
@@ -1775,16 +1760,14 @@ class Whisperapp:
             )
             self.safe_after(lambda: messagebox.showerror("タイムアウト", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約がタイムアウトしました"))
-            self.cleanup_resources()
 
         except TimeoutError as e:
             error_msg = str(e)
             self.safe_after(lambda: messagebox.showerror("タイムアウト", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約がタイムアウトしました"))
-            self.cleanup_resources()
+
 
         except Exception as e:
-            self.cleanup_resources()
             error_msg = f"要約処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約に失敗しました"))
