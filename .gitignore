@@ -8,6 +8,7 @@ env/
 
 whisper_config.json
 whisper_config_windows.json
+whisper_config_macos.json
 .env
 .env.*
 
