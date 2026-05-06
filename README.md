@@ -1,5 +1,4 @@
-<img width="1312" height="1144" alt="LocalAIMeetingTool-v4 5_SS" src="https://github.com/user-attachments/assets/407193ab-4b34-4230-9648-ccc6b2afcd12" />
-
+<img width="1312" height="1144" alt="LocalAIMeetingTool-v4 5_SS" src="https://github.com/user-attachments/assets/25182ae0-4cc6-45d8-9475-b81a513c9638" />
 # Local AI Meetingtool
 
 ローカル実行を前提にした、音声・動画の文字起こし、話者分離、要約アプリです。
