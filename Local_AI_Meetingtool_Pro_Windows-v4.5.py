@@ -18,6 +18,7 @@ import importlib
 import platform
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime #自動保存用のタイムスタンプ取得
 
@@ -1537,7 +1538,69 @@ class Whisperapp:
         gc.collect()
         self.clear_torch_cache()
 
+    def prepare_audio_for_diarization(self, filepath):
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "話者分離用の音声変換に ffmpeg が必要です。\n"
+                "ffmpegをインストールし、PATHから実行できる状態にしてください。"
+            )
+
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="meetingtool_diarization_",
+            suffix=".wav",
+            delete=False,
+        )
+        temp_path = temp_file.name
+        temp_file.close()
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            filepath,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-af",
+            "aresample=async=1:first_pts=0,apad=whole_dur=10,apad=pad_dur=1",
+            temp_path,
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as e:
+            self.remove_temp_file(temp_path)
+            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{e}") from e
+
+        if result.returncode != 0:
+            self.remove_temp_file(temp_path)
+            error_detail = result.stderr.strip() or result.stdout.strip() or "ffmpegの実行に失敗しました。"
+            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{error_detail}")
+
+        return temp_path
+
+    def remove_temp_file(self, filepath):
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            logging.warning(f"一時ファイルの削除に失敗しました: {filepath} ({e})")
+
     def run_process(self, task_config):
+        temp_diarization_path = None
         try:
             filepath = task_config["filepath"]
             token = task_config["token"]
@@ -1599,6 +1662,10 @@ class Whisperapp:
             # 2.話者分離の実行
             if do_diarize:
                 self.ensure_not_cancelled() # キャンセルされていないか確認
+                self.safe_after(lambda: self.status_label.configure(text="話者解析用の音声を準備中..."))
+                temp_diarization_path = self.prepare_audio_for_diarization(filepath)
+                diarization_filepath = temp_diarization_path
+                self.ensure_not_cancelled()
                 self.safe_after(lambda: self.status_label.configure(text="話者解析中... (初回はモデルをロードします)"))
                 if self.diarization_pipeline is None:
                     auth_param = token if token else None
@@ -1629,7 +1696,7 @@ class Whisperapp:
                             text=f"話者解析中...しばらくお待ちください... ({percentage_int}%)"))
 
                 num_spk = None if task_config["num_speakers"] == "自動" else int(task_config["num_speakers"])
-                diarization_result = self.run_diarization_pipeline_with_fallback(filepath, num_spk, diarization_hook)
+                diarization_result = self.run_diarization_pipeline_with_fallback(diarization_filepath, num_spk, diarization_hook)
 
                 self.ensure_not_cancelled()
                 
@@ -1696,6 +1763,9 @@ class Whisperapp:
             error_msg = f"処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("エラーが発生しました"))
+
+        finally:
+            self.remove_temp_file(temp_diarization_path)
 
     #結果表示
     def show_result(self, text, auto_mask_counts=None):
