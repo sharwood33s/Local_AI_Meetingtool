@@ -152,6 +152,7 @@ Windows版では `whisper_config_windows.json` を使用します。処理性能
 - `windows_whisper_device`: `cuda` または `cpu` を指定します。
 - `windows_whisper_compute_type`: CUDA使用時の計算型です。
 - `windows_whisper_batch_size`: Windows版のbatched inferenceのバッチサイズです。
+- CUDAが検出できない場合やCUDA実行時に失敗した場合、Windows版のWhisperは自動的にCPU `int8` へフォールバックします。
 
 ## Local Files
 

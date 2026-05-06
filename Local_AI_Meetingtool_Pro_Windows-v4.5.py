@@ -357,14 +357,54 @@ class Whisperapp:
         }
 
     def get_torch_accelerator(self):
-        if torch.cuda.is_available():
+        if self.is_cuda_available():
             return "cuda"
         return "cpu"
 
+    # CUDAが使用可能かチェック
+    def is_cuda_available(self):
+        try:
+            return torch.cuda.is_available()
+        except Exception as e:
+            logging.warning(f"CUDAの利用可否チェックに失敗しました: {e}")
+            return False
+
+    def is_cuda_runtime_error(self, error):
+        error_text = str(error).lower()
+        cuda_markers = (
+            "cuda",
+            "cudnn",
+            "cublas",
+            "cudart",
+            "ctranslate2",
+            "gpu",
+            "nvidia",
+            "out of memory",
+            "no kernel image",
+            "invalid device",
+            "compute capability",
+            "driver version",
+            "not compiled with cuda",
+        )
+        return any(marker in error_text for marker in cuda_markers)
+
+    # CUDAが使えない場合はCPUで処理
+    def notify_cuda_fallback(self, task_label):
+        self.safe_after(lambda: self.status_label.configure(
+            text=f"CUDAが使えないためCPUで{task_label}を続行します..."
+        ))
+
     def get_windows_whisper_device(self):
-        if self.windows_whisper_device == "cuda" and not torch.cuda.is_available():
+        if self.windows_whisper_device == "cuda" and not self.is_cuda_available():
+            logging.info("CUDAが検出できないため、WhisperをCPUで実行します。")
             return "cpu"
         return self.windows_whisper_device
+
+    # CUDAがエラーのなったらCPUで処理
+    def get_windows_whisper_compute_type(self, device):
+        if device == "cuda":
+            return self.windows_whisper_compute_type
+        return "int8"
 
     def get_cached_whisper_model(self, model_path, device, compute_type):
         cache_key = (model_path, device, compute_type, self.windows_whisper_cpu_threads, self.windows_whisper_num_workers)
@@ -380,8 +420,48 @@ class Whisperapp:
         return self.whisper_model_cache[cache_key]
 
     def clear_torch_cache(self):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if self.is_cuda_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception as e:
+                logging.warning(f"CUDAキャッシュの解放に失敗しました: {e}")
+
+    def move_diarization_pipeline_to_best_device(self):
+        accelerator = self.get_torch_accelerator()
+        if accelerator == "cpu" or not hasattr(self.diarization_pipeline, "to"):
+            return "cpu"
+
+        try:
+            self.diarization_pipeline.to(torch.device(accelerator))
+            return accelerator
+        except Exception as e:
+            if self.is_cuda_runtime_error(e):
+                logging.warning("話者分離モデルのCUDA移行に失敗したためCPUへフォールバックします。", exc_info=True)
+                self.move_diarization_pipeline_to_cpu()
+                self.clear_torch_cache()
+                self.notify_cuda_fallback("話者解析")
+                return "cpu"
+            raise
+
+    def move_diarization_pipeline_to_cpu(self):
+        if self.diarization_pipeline is None or not hasattr(self.diarization_pipeline, "to"):
+            return
+        try:
+            self.diarization_pipeline.to(torch.device("cpu"))
+        except Exception as e:
+            logging.warning(f"話者分離モデルのCPU移行に失敗しました: {e}")
+
+    def run_diarization_pipeline_with_fallback(self, filepath, num_speakers, hook):
+        try:
+            return self.diarization_pipeline(filepath, num_speakers=num_speakers, hook=hook)
+        except Exception as e:
+            if self.is_cuda_runtime_error(e):
+                logging.warning("話者解析のCUDA実行に失敗したためCPUで再試行します。", exc_info=True)
+                self.move_diarization_pipeline_to_cpu()
+                self.clear_torch_cache()
+                self.notify_cuda_fallback("話者解析")
+                return self.diarization_pipeline(filepath, num_speakers=num_speakers, hook=hook)
+            raise
 
     def transcribe_with_whisper(self, filepath, model_path, initial_prompt, whisper_options):
         if WhisperModel is None:
@@ -391,7 +471,38 @@ class Whisperapp:
             )
 
         device = self.get_windows_whisper_device()
-        compute_type = self.windows_whisper_compute_type if device == "cuda" else "int8"
+        allow_batched = True
+        if self.windows_whisper_device == "cuda" and device == "cpu":
+            allow_batched = False
+            self.notify_cuda_fallback("文字起こし")
+
+        try:
+            return self.transcribe_with_whisper_on_device(
+                filepath,
+                model_path,
+                initial_prompt,
+                whisper_options,
+                device,
+                allow_batched,
+            )
+        except Exception as e:
+            if device == "cuda" and self.is_cuda_runtime_error(e):
+                logging.warning("WhisperのCUDA実行に失敗したためCPUへフォールバックします。", exc_info=True)
+                self.whisper_model_cache.clear()
+                self.clear_torch_cache()
+                self.notify_cuda_fallback("文字起こし")
+                return self.transcribe_with_whisper_on_device(
+                    filepath,
+                    model_path,
+                    initial_prompt,
+                    whisper_options,
+                    "cpu",
+                    False,
+                )
+            raise
+
+    def transcribe_with_whisper_on_device(self, filepath, model_path, initial_prompt, whisper_options, device, allow_batched=True):
+        compute_type = self.get_windows_whisper_compute_type(device)
         model = self.get_cached_whisper_model(model_path, device, compute_type)
 
         faster_whisper_options = dict(whisper_options)
@@ -400,7 +511,13 @@ class Whisperapp:
         faster_whisper_options["beam_size"] = self.windows_whisper_beam_size
         faster_whisper_options["best_of"] = self.windows_whisper_best_of
 
-        if self.windows_whisper_use_batched and self.windows_whisper_batch_size > 1 and BatchedInferencePipeline is not None:
+        use_batched = (
+            allow_batched
+            and self.windows_whisper_use_batched
+            and self.windows_whisper_batch_size > 1
+            and BatchedInferencePipeline is not None
+        )
+        if use_batched:
             batched_model = BatchedInferencePipeline(model=model)
             segments, info = batched_model.transcribe(
                 filepath,
@@ -1489,9 +1606,7 @@ class Whisperapp:
                         Pipeline = self.load_diarization_pipeline_class()
                         self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=auth_param)
 
-                        accelerator = self.get_torch_accelerator()
-                        if accelerator != "cpu" and hasattr(self.diarization_pipeline, "to"):
-                            self.diarization_pipeline.to(torch.device(accelerator))
+                        self.move_diarization_pipeline_to_best_device()
                     except Exception as e:
                         raise RuntimeError(f"話者分離モデルの読み込みに失敗しました:\n{e}")
                 if hasattr(self.diarization_pipeline, "set_batch_size"):
@@ -1514,7 +1629,7 @@ class Whisperapp:
                             text=f"話者解析中...しばらくお待ちください... ({percentage_int}%)"))
 
                 num_spk = None if task_config["num_speakers"] == "自動" else int(task_config["num_speakers"])
-                diarization_result = self.diarization_pipeline(filepath, num_speakers=num_spk, hook=diarization_hook)
+                diarization_result = self.run_diarization_pipeline_with_fallback(filepath, num_spk, diarization_hook)
 
                 self.ensure_not_cancelled()
                 
