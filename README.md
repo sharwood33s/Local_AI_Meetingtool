@@ -1,4 +1,4 @@
-<img width="1112" height="944" alt="Local AI Meetingtool screenshot" src="https://github.com/user-attachments/assets/7f26a098-8aad-48ab-bb75-70cce28e73a9" />
+<img width="1312" height="1144" alt="LocalAIMeetingTool-v4 5_SS" src="https://github.com/user-attachments/assets/407193ab-4b34-4230-9648-ccc6b2afcd12" />
 
 # Local AI Meetingtool
 
