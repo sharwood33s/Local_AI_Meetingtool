@@ -3,7 +3,7 @@
 #Windowsではfaster-whisperを使用して動作
 #7800X3D/RTX5070Ti-16GBに合わせた設定
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import TclError, filedialog, messagebox
 import threading
 import os
 import logging
@@ -65,6 +65,7 @@ class Whisperapp:
         if platform.system() != "Windows":
             raise RuntimeError("Local_AI_Meetingtool_Pro_Windows-v4.5.py is Windows-only.")
         self.is_closing = False
+        self.after_ids = set()
 
         # Windows標準フォントを使用
         self.font_title = (self.WINDOWS_UI_FONT, 15, "bold")
@@ -555,8 +556,8 @@ class Whisperapp:
         self.summarize_btn.configure(text=f"{backend}で要約")
 
     #コンフィグの保存
-    def save_config(self):
-        self.save_hf_token()
+    def save_config(self, show_warnings=True):
+        self.save_hf_token(show_warnings=show_warnings)
         config = self.read_config_file()
         # 古い設定ファイルに残っている可能性があるトークンは、再保存時にJSONから除外する
         config.pop("hf_token", None)
@@ -616,17 +617,17 @@ class Whisperapp:
         except ImportError as e:
             raise RuntimeError(
                 "話者分離を使うには pyannote-audio が必要です。"
-                "requirements.txt を使って依存関係をインストールしてください。"
+                "requirements-windows.txt を使って依存関係をインストールしてください。"
             ) from e
 
-    def save_hf_token(self):
+    def save_hf_token(self, show_warnings=True):
         token = self.token_entry.get().strip()
         if self.keyring is None:
-            if token:
+            if token and show_warnings:
                 messagebox.showwarning(
                     "トークンを保存できません",
                     "keyring パッケージが見つからないため、Hugging Faceトークンは安全に保存されません。\n"
-                    "requirements.txt を使って依存関係をインストールしてください。"
+                    "requirements-windows.txt を使って依存関係をインストールしてください。"
                 )
             return False
 
@@ -640,7 +641,8 @@ class Whisperapp:
                     pass
             return True
         except Exception as e:
-            messagebox.showwarning("トークン保存エラー", f"Hugging Faceトークンを安全に保存できませんでした:\n{e}")
+            if show_warnings:
+                messagebox.showwarning("トークン保存エラー", f"Hugging Faceトークンを安全に保存できませんでした:\n{e}")
             return False
 
     #コンフィグの読み込み
@@ -824,19 +826,65 @@ class Whisperapp:
                 self.save_config()
 
     def on_closing(self):
+        if self.is_closing:
+            return
         self.is_closing = True
         self.cancel_event.set()
-        self.save_config()
-        self.root.destroy()
+        self.cancel_pending_after_callbacks()
+        self.stop_progress_animation()
+        try:
+            self.save_config(show_warnings=False)
+        except Exception as e:
+            logging.warning(f"終了時の設定保存に失敗しました: {e}")
+        try:
+            self.root.destroy()
+        except TclError as e:
+            logging.debug(f"終了時のウィンドウ破棄をスキップしました: {e}")
+
+    def cancel_pending_after_callbacks(self):
+        for after_id in list(self.after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except Exception as e:
+                logging.debug(f"終了時のafterキャンセルをスキップしました: {e}")
+        self.after_ids.clear()
+
+    def stop_progress_animation(self):
+        if not hasattr(self, "progress"):
+            return
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+        except Exception as e:
+            logging.debug(f"終了時のプログレスバー停止をスキップしました: {e}")
 
     def safe_after(self, callback):
         if self.is_closing:
             return
+        after_id = None
+
+        def run_callback():
+            self.after_ids.discard(after_id)
+            if self.is_closing:
+                return
+            try:
+                if not self.root.winfo_exists():
+                    return
+                callback()
+            except TclError as e:
+                if not self.is_closing:
+                    logging.error(f"UI 更新エラー (safe_after): {e}")
+            except Exception as e:
+                logging.error(f"UI 更新エラー (safe_after): {e}")
+
         try:
-            self.root.after(0,callback)
+            after_id = self.root.after(0, run_callback)
+            self.after_ids.add(after_id)
+        except TclError as e:
+            if not self.is_closing:
+                logging.error(f"UI 更新エラー (safe_after): {e}")
         except Exception as e:
             logging.error(f"UI 更新エラー (safe_after): {e}")
-            pass
 
     def has_result_text(self):
         return bool(self.result_area.get("1.0", ctk.END).strip())
@@ -1034,10 +1082,12 @@ class Whisperapp:
                 "Ollamaをインストールし、ターミナルで `ollama` が実行できる状態にしてから再実行してください。"
             )
 
+        last_error = ""
         try:
             result = self.run_ollama_list()
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired:
             result = None
+            last_error = "Ollama CLI の起動確認がタイムアウトしました。"
         except OSError as e:
             raise OllamaConnectionError(
                 f"Ollama CLI の実行に失敗しました:\n{e}"
@@ -1053,7 +1103,8 @@ class Whisperapp:
                     f"Ollama の自動起動に失敗しました:\n{e}"
                 ) from e
 
-            last_error = "" if result is None else result.stderr.strip()
+            if result is not None:
+                last_error = result.stderr.strip()
             for _ in range(12):
                 self.ensure_not_cancelled()
                 time.sleep(1)
@@ -1151,7 +1202,7 @@ class Whisperapp:
                 continue
 
             entries = [entry.strip() for entry in re.split(r"[、,，]", line) if entry.strip()]
-            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み児だけ2列を置換ペアにする
+            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み時だけ2列を置換ペアにする
             if allow_csv_pairs and len(entries) == 2:
                 add_mapping(entries[0], entries[1], line)
             else:
@@ -1221,7 +1272,7 @@ class Whisperapp:
                     continue
 
                 source, target = split_mapping(entry)
-                if source is None:
+                if source is None or target is None:
                     invalid_entries.append(entry)
                     continue
 
@@ -1631,7 +1682,7 @@ class Whisperapp:
                 "logprob_threshold": -0.8,              #無音区間の暴走抑止
                 "temperature": 0.0,                      #ランダムな記号の生成抑止
                 "word_timestamps": False,               #タイムスタンプ計算のバグによる記号生成の抑止
-                "best_of": 3                            #5つの候補から最も適切なものを選択
+                "best_of": 3                            #3つの候補から最も適切なものを選択
             }
             # Windows専用版ではfaster-whisperで文字起こし
             whisper_result = self.transcribe_with_whisper(
@@ -1923,10 +1974,16 @@ class Whisperapp:
                 if max_tokens:
                     request_params["max_tokens"] = max_tokens
 
+                if client is None:
+                    raise RuntimeError("LM Studio クライアントが初期化されていません。")
+
                 response = client.chat.completions.create(
                     **request_params
                 )
-                return response.choices[0].message.content.strip()
+                content = response.choices[0].message.content
+                if not content:
+                    raise RuntimeError("LM Studio から空の応答が返されました。")
+                return content.strip()
 
             # 分割要約を階層的に再分割して統合
             def make_summary_groups(summary_items, max_chars=None, max_items=None):
