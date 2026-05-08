@@ -1,10 +1,9 @@
-#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio使用）
-#使用時はLM Studioでローカルサーバーを起動し、llamaを使用すること
+#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio / Ollama CLI使用）
+#使用時はLM Studioでローカルサーバーを起動するか、Ollama CLIでモデルを用意すること
 #Windowsでは動作しないので注意
 #M5 Pro 48GBに合わせた設定
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-import mlx_whisper
 import threading
 import os
 import logging
@@ -62,6 +61,7 @@ class Whisperapp:
         self.processing_thread = None
         self.cancel_event = threading.Event()
         self.active_task = None
+        self.mlx_whisper_module = None
         self.keyring = self.load_keyring()
         self.keyring_service = "Local AI MeetingTool Pro Ver.4"
         self.keyring_username = "huggingface_token"
@@ -398,8 +398,30 @@ class Whisperapp:
         except ImportError as e:
             raise RuntimeError(
                 "話者分離を使うには pyannote-audio が必要です。"
-                "requirements.txt を使って依存関係をインストールしてください。"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
             ) from e
+
+    def load_mlx_whisper(self):
+        # MLXはimport時にMetalデバイスへ触れるため、文字起こし開始時まで遅延ロードする
+        if self.mlx_whisper_module is not None:
+            return self.mlx_whisper_module
+
+        try:
+            self.mlx_whisper_module = importlib.import_module("mlx_whisper")
+            return self.mlx_whisper_module
+        except ImportError as e:
+            raise RuntimeError(
+                "macOSで文字起こしするには mlx-whisper が必要です。\n"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
+            ) from e
+        except RuntimeError as e:
+            error_text = str(e).lower()
+            if "metal" in error_text or "load_device" in error_text or "gpu" in error_text:
+                raise RuntimeError(
+                    "MLX/Metalデバイスを利用できないため、文字起こしを開始できません。\n"
+                    "Apple Silicon Macの通常ログイン環境で実行してください。"
+                ) from e
+            raise
 
     def clear_torch_cache(self):
         try:
@@ -486,7 +508,7 @@ class Whisperapp:
                 messagebox.showwarning(
                     "トークンを保存できません",
                     "keyring パッケージが見つからないため、Hugging Faceトークンは安全に保存されません。\n"
-                    "requirements.txt を使って依存関係をインストールしてください。"
+                    "requirements-mac.txt を使って依存関係をインストールしてください。"
                 )
             return False
 
@@ -830,10 +852,12 @@ class Whisperapp:
                 "Ollamaをインストールし、ターミナルで `ollama` が実行できる状態にしてから再実行してください。"
             )
 
+        last_error = ""
         try:
             result = self.run_ollama_list()
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired:
             result = None
+            last_error = "Ollama CLI の起動確認がタイムアウトしました。"
         except OSError as e:
             raise OllamaConnectionError(
                 f"Ollama CLI の実行に失敗しました:\n{e}"
@@ -849,7 +873,8 @@ class Whisperapp:
                     f"Ollama の自動起動に失敗しました:\n{e}"
                 ) from e
 
-            last_error = "" if result is None else result.stderr.strip()
+            if result is not None:
+                last_error = result.stderr.strip()
             for _ in range(12):
                 self.ensure_not_cancelled()
                 time.sleep(1)
@@ -947,7 +972,7 @@ class Whisperapp:
                 continue
 
             entries = [entry.strip() for entry in re.split(r"[、,，]", line) if entry.strip()]
-            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み児だけ2列を置換ペアにする
+            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み時だけ2列を置換ペアにする
             if allow_csv_pairs and len(entries) == 2:
                 add_mapping(entries[0], entries[1], line)
             else:
@@ -1017,7 +1042,7 @@ class Whisperapp:
                     continue
 
                 source, target = split_mapping(entry)
-                if source is None:
+                if source is None or target is None:
                     invalid_entries.append(entry)
                     continue
 
@@ -1362,9 +1387,10 @@ class Whisperapp:
                 "logprob_threshold": -0.8,              #無音区間の暴走抑止
                 "temperature": 0.0,                      #ランダムな記号の生成抑止
                 "word_timestamps": False,               #タイムスタンプ計算のバグによる記号生成の抑止
-                "best_of": 3                            #5つの候補から最も適切なものを選択
+                "best_of": 3                            #3つの候補から最も適切なものを選択
             }
             # Whisperで文字起こし
+            mlx_whisper = self.load_mlx_whisper()
             whisper_result = mlx_whisper.transcribe(
                 filepath,
                 path_or_hf_repo=model_path,
@@ -1656,10 +1682,16 @@ class Whisperapp:
                 if max_tokens:
                     request_params["max_tokens"] = max_tokens
 
+                if client is None:
+                    raise RuntimeError("LM Studio クライアントが初期化されていません。")
+
                 response = client.chat.completions.create(
                     **request_params
                 )
-                return response.choices[0].message.content.strip()
+                content = response.choices[0].message.content
+                if not content:
+                    raise RuntimeError("LM Studio から空の応答が返されました。")
+                return content.strip()
 
             # 分割要約を階層的に再分割して統合
             def make_summary_groups(summary_items, max_chars=None, max_items=None):
