@@ -44,6 +44,25 @@ ctk.set_default_color_theme("blue")
 class Whisperapp:
     SUMMARY_HEADER = "=========================\n【要約結果】\n========================="
     SUMMARY_SECTION_PATTERN = re.compile(r"\n\s*\n=+\n【要約結果】\n=+\n.*\Z", re.DOTALL)
+    SUMMARY_ONLY_INSTRUCTION = (
+        "思考過程、推論、検討メモ、内部メモ、<think>タグは出力しないでください。"
+        "最終的な要約本文だけを出力してください。"
+    )
+    REASONING_TAG_PATTERN = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+    STRAY_REASONING_TAG_PATTERN = re.compile(r"</?think\b[^>]*>", re.IGNORECASE)
+    REASONING_LABEL_WITH_SUMMARY_PATTERN = re.compile(
+        r"^\s*(?:思考プロセス|思考過程|推論|Reasoning|Thought process|Analysis)\s*[:：].*?"
+        r"(?=\n\s*(?:要約結果|要約|Summary|Final answer|回答)\s*[:：])",
+        re.IGNORECASE | re.DOTALL,
+    )
+    REASONING_LABEL_PARAGRAPH_PATTERN = re.compile(
+        r"^\s*(?:思考プロセス|思考過程|推論|Reasoning|Thought process|Analysis)\s*[:：].*?(?:\n\s*\n|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    SUMMARY_LABEL_PATTERN = re.compile(
+        r"^\s*(?:要約結果|要約|Summary|Final answer|回答)\s*[:：]\s*",
+        re.IGNORECASE,
+    )
 
     def __init__(self, root):
         self.root = root
@@ -769,6 +788,23 @@ class Whisperapp:
             return ""
         return summary_section[header_index + len(self.SUMMARY_HEADER):].strip()
 
+    # ollamaで要約する時思考プロセスを要約文に入れない
+    def extract_summary_only(self, text):
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            cleaned = self.REASONING_TAG_PATTERN.sub("", cleaned).strip()
+
+        cleaned = self.STRAY_REASONING_TAG_PATTERN.sub("", cleaned).strip()
+        cleaned = self.REASONING_LABEL_WITH_SUMMARY_PATTERN.sub("", cleaned).strip()
+        cleaned = self.REASONING_LABEL_PARAGRAPH_PATTERN.sub("", cleaned).strip()
+        cleaned = self.SUMMARY_LABEL_PATTERN.sub("", cleaned).strip()
+        return cleaned
+
     # 文字起こしが完了したらテキストファイルを自動保存
     def auto_save_text(self, text):
         if not self.filepath or not text.strip():
@@ -957,7 +993,32 @@ class Whisperapp:
 
         return True
 
-    def build_ollama_prompt(self, messages):
+    # ollamaで処理した時に思考プロセスを要約に反映しない。
+    def with_summary_output_guard(self, messages):
+        guarded_messages = []
+        has_system_message = False
+
+        for message in messages:
+            guarded_message = dict(message)
+            role = guarded_message.get("role", "user")
+            if role == "system":
+                has_system_message = True
+                content = guarded_message.get("content", "").strip()
+                if self.SUMMARY_ONLY_INSTRUCTION not in content:
+                    content = f"{content}\n\n{self.SUMMARY_ONLY_INSTRUCTION}" if content else self.SUMMARY_ONLY_INSTRUCTION
+                guarded_message["content"] = content
+            guarded_messages.append(guarded_message)
+
+        if not has_system_message:
+            guarded_messages.insert(0, {"role": "system", "content": self.SUMMARY_ONLY_INSTRUCTION})
+
+        return guarded_messages
+
+    def should_disable_ollama_thinking(self, ollama_model):
+        model = (ollama_model or "").lower()
+        return "qwen3" in model or "qwq" in model
+
+    def build_ollama_prompt(self, messages, ollama_model=""):
         # OpenAI互換のmessagesをOllama CLIへ渡す単一プロンプトへ変換する
         prompt_parts = []
         for message in messages:
@@ -972,7 +1033,10 @@ class Whisperapp:
             else:
                 prompt_parts.append(f"User:\n{content}")
         prompt_parts.append("Assistant:")
-        return "\n\n".join(prompt_parts)
+        prompt = "\n\n".join(prompt_parts)
+        if self.should_disable_ollama_thinking(ollama_model):
+            prompt = f"/no_think\n\n{prompt}"
+        return prompt
 
     # ユーザー辞書の設定
     def parse_dictionary_text(self, dictionary_text, allow_csv_pairs=False):
@@ -1691,9 +1755,10 @@ class Whisperapp:
                 )
 
             def request_summary(messages, max_tokens=None):
+                messages = self.with_summary_output_guard(messages)
                 if summary_backend == "Ollama CLI":
                     # Ollama CLIはmessagesを直接受け取らないため、プロンプト文字列に整形して標準入力で渡す
-                    prompt = self.build_ollama_prompt(messages)
+                    prompt = self.build_ollama_prompt(messages, ollama_model)
                     try:
                         response = subprocess.run(
                             ["ollama", "run", ollama_model],
@@ -1718,9 +1783,12 @@ class Whisperapp:
                             f"{response.stderr.strip()}"
                         )
 
-                    content = response.stdout.strip()
+                    content = self.extract_summary_only(response.stdout)
                     if not content:
-                        raise RuntimeError("Ollama CLI から空の応答が返されました。")
+                        raise RuntimeError(
+                            "Ollama CLI から要約本文を抽出できませんでした。"
+                            "モデルが思考過程のみを返した可能性があります。"
+                        )
                     return content
 
                 request_params = {
@@ -1737,10 +1805,13 @@ class Whisperapp:
                 response = client.chat.completions.create(
                     **request_params
                 )
-                content = response.choices[0].message.content
+                content = self.extract_summary_only(response.choices[0].message.content)
                 if not content:
-                    raise RuntimeError("LM Studio から空の応答が返されました。")
-                return content.strip()
+                    raise RuntimeError(
+                        "LM Studio から要約本文を抽出できませんでした。"
+                        "モデルが思考過程のみを返した可能性があります。"
+                    )
+                return content
 
             # 分割要約を階層的に再分割して統合
             def make_summary_groups(summary_items, max_chars=None, max_items=None):
@@ -1959,7 +2030,7 @@ class Whisperapp:
 
     #要約結果をフォーマット
     def show_summary_result(self, summary): 
-        summary_text = summary.strip()
+        summary_text = self.extract_summary_only(summary)
         if self.privacy_mask_auto_var.get():
             summary_text, _ = self.mask_privacy_text(summary_text)
 
