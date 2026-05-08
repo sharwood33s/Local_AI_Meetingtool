@@ -3,7 +3,7 @@
 #Windowsでは動作しないので注意
 #M5 Pro 48GBに合わせた設定
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import TclError, filedialog, messagebox
 import threading
 import os
 import logging
@@ -51,6 +51,7 @@ class Whisperapp:
         self.root.geometry("1200x1000")
         self.root.configure(fg_color="#FFFFFF")
         self.is_closing = False
+        self.after_ids = set()
 
         # Mac用フォント設定
         self.font_title = ("Hiragino Sans", 15, "bold")
@@ -345,8 +346,8 @@ class Whisperapp:
         self.summarize_btn.configure(text=f"{backend}で要約")
 
     #コンフィグの保存
-    def save_config(self):
-        self.save_hf_token()
+    def save_config(self, show_warnings=True):
+        self.save_hf_token(show_warnings=show_warnings)
         config = self.read_config_file()
         # 古い設定ファイルに残っている可能性があるトークンは、再保存時にJSONから除外する
         config.pop("hf_token", None)
@@ -501,10 +502,10 @@ class Whisperapp:
         except Exception as e:
             logging.warning(f"一時ファイルの削除に失敗しました: {filepath} ({e})")
 
-    def save_hf_token(self):
+    def save_hf_token(self, show_warnings=True):
         token = self.token_entry.get().strip()
         if self.keyring is None:
-            if token:
+            if token and show_warnings:
                 messagebox.showwarning(
                     "トークンを保存できません",
                     "keyring パッケージが見つからないため、Hugging Faceトークンは安全に保存されません。\n"
@@ -522,7 +523,8 @@ class Whisperapp:
                     pass
             return True
         except Exception as e:
-            messagebox.showwarning("トークン保存エラー", f"Hugging Faceトークンを安全に保存できませんでした:\n{e}")
+            if show_warnings:
+                messagebox.showwarning("トークン保存エラー", f"Hugging Faceトークンを安全に保存できませんでした:\n{e}")
             return False
 
     #コンフィグの読み込み
@@ -630,20 +632,67 @@ class Whisperapp:
             if self.save_hf_token():
                 self.save_config()
 
+    # 終了プロセス
     def on_closing(self):
+        if self.is_closing:
+            return
         self.is_closing = True
         self.cancel_event.set()
-        self.save_config()
-        self.root.destroy()
+        self.cancel_pending_after_callbacks()
+        self.stop_progress_animation()
+        try:
+            self.save_config(show_warnings=False)
+        except Exception as e:
+            logging.warning(f"終了時の設定保存に失敗しました: {e}")
+        try:
+            self.root.destroy()
+        except TclError as e:
+            logging.debug(f"終了時のウィンドウ破棄をスキップしました: {e}")
+
+    def cancel_pending_after_callbacks(self):
+        for after_id in list(self.after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except Exception as e:
+                logging.debug(f"終了時のafterキャンセルをスキップしました: {e}")
+        self.after_ids.clear()
+
+    def stop_progress_animation(self):
+        if not hasattr(self, "progress"):
+            return
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+        except Exception as e:
+            logging.debug(f"終了時のプログレスバー停止をスキップしました: {e}")
 
     def safe_after(self, callback):
         if self.is_closing:
             return
+        after_id = None
+
+        def run_callback():
+            self.after_ids.discard(after_id)
+            if self.is_closing:
+                return
+            try:
+                if not self.root.winfo_exists():
+                    return
+                callback()
+            except TclError as e:
+                if not self.is_closing:
+                    logging.error(f"UI 更新エラー (safe_after): {e}")
+            except Exception as e:
+                logging.error(f"UI 更新エラー (safe_after): {e}")
+
         try:
-            self.root.after(0,callback)
+            after_id = self.root.after(0, run_callback)
+            self.after_ids.add(after_id)
+        except TclError as e:
+            if not self.is_closing:
+                logging.error(f"UI 更新エラー (safe_after): {e}")
         except Exception as e:
             logging.error(f"UI 更新エラー (safe_after): {e}")
-            pass
 
     def has_result_text(self):
         return bool(self.result_area.get("1.0", ctk.END).strip())
