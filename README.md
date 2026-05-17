@@ -124,7 +124,7 @@ Ollama CLIを使う場合:
 
 設定ファイル:
 
-- macOS版設定: `whisper_config.json`
+- macOS版設定: `whisper_config_macos.json`
 - Windows版設定: `whisper_config_windows.json`
 
 Windows版では `whisper_config_windows.json` を使用します。処理性能に関わる値はこのファイルで調整できます。
