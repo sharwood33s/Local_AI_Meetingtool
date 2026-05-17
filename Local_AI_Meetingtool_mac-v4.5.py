@@ -14,6 +14,7 @@ import gc
 import torch
 import openai
 import importlib
+import multiprocessing
 import platform
 import shutil
 import subprocess
@@ -29,6 +30,54 @@ class LMStudioConnectionError(Exception):
 
 class OllamaConnectionError(Exception):
     pass
+
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+def mlx_whisper_transcribe_worker(result_path, filepath, model_path, initial_prompt, whisper_options):
+    try:
+        mlx_whisper = importlib.import_module("mlx_whisper")
+        whisper_result = mlx_whisper.transcribe(
+            filepath,
+            path_or_hf_repo=model_path,
+            initial_prompt=initial_prompt,
+            **whisper_options,
+        )
+        payload = {"ok": True, "result": make_json_safe(whisper_result)}
+    except ImportError as e:
+        payload = {
+            "ok": False,
+            "error": (
+                "macOSで文字起こしするには mlx-whisper が必要です。\n"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
+            ),
+        }
+    except RuntimeError as e:
+        error_text = str(e).lower()
+        if "metal" in error_text or "load_device" in error_text or "gpu" in error_text:
+            error_message = (
+                "MLX/Metalデバイスを利用できないため、文字起こしを開始できません。\n"
+                "Apple Silicon Macの通常ログイン環境で実行してください。"
+            )
+        else:
+            error_message = str(e)
+        payload = {"ok": False, "error": error_message}
+    except BaseException as e:
+        payload = {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
 
 # --- 環境設定 ---
 os.environ["HF_HUB_OFFLINE"] = "0"
@@ -79,6 +128,9 @@ class Whisperapp:
         self.processing_thread = None
         self.cancel_event = threading.Event()
         self.active_task = None
+        self.current_subprocess = None
+        self.current_worker_process = None
+        self.process_lock = threading.Lock()
         self.mlx_whisper_module = None
         self.keyring = self.load_keyring()
         self.keyring_service = "Local AI MeetingTool Ver.4"
@@ -455,6 +507,136 @@ class Whisperapp:
         gc.collect()
         self.clear_torch_cache()
 
+    def set_current_subprocess(self, process):
+        with self.process_lock:
+            self.current_subprocess = process
+
+    def clear_current_subprocess(self, process):
+        with self.process_lock:
+            if self.current_subprocess is process:
+                self.current_subprocess = None
+
+    def set_current_worker_process(self, process):
+        with self.process_lock:
+            self.current_worker_process = process
+
+    def clear_current_worker_process(self, process):
+        with self.process_lock:
+            if self.current_worker_process is process:
+                self.current_worker_process = None
+
+    def terminate_subprocess(self, process):
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+        except Exception as e:
+            logging.warning(f"実行中プロセスの停止に失敗しました: {e}")
+
+    def terminate_worker_process(self, process):
+        if process is None:
+            return
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join(timeout=3)
+        except Exception as e:
+            logging.warning(f"文字起こしワーカープロセスの停止に失敗しました: {e}")
+
+    def terminate_active_processes(self):
+        with self.process_lock:
+            current_subprocess = self.current_subprocess
+            current_worker_process = self.current_worker_process
+        self.terminate_subprocess(current_subprocess)
+        self.terminate_worker_process(current_worker_process)
+
+    def run_cancellable_subprocess(self, command, input_text=None, timeout=None):
+        self.ensure_not_cancelled()
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.set_current_subprocess(process)
+        start_time = time.monotonic()
+        communicate_input = input_text
+
+        try:
+            while True:
+                self.ensure_not_cancelled()
+                if timeout is not None and time.monotonic() - start_time > timeout:
+                    self.terminate_subprocess(process)
+                    raise subprocess.TimeoutExpired(command, timeout)
+
+                try:
+                    stdout, stderr = process.communicate(input=communicate_input, timeout=0.2)
+                    self.ensure_not_cancelled()
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    communicate_input = None
+        except CancelledError:
+            self.terminate_subprocess(process)
+            raise
+        finally:
+            self.clear_current_subprocess(process)
+
+    def run_mlx_whisper_transcribe(self, filepath, model_path, initial_prompt, whisper_options):
+        result_file = tempfile.NamedTemporaryFile(
+            prefix="meetingtool_whisper_",
+            suffix=".json",
+            delete=False,
+        )
+        result_path = result_file.name
+        result_file.close()
+
+        ctx = multiprocessing.get_context("spawn")
+        process = ctx.Process(
+            target=mlx_whisper_transcribe_worker,
+            args=(result_path, filepath, model_path, initial_prompt, whisper_options),
+        )
+        process.daemon = True
+        self.set_current_worker_process(process)
+
+        try:
+            process.start()
+            while process.is_alive():
+                if self.cancel_event.is_set():
+                    self.terminate_worker_process(process)
+                    raise CancelledError()
+                process.join(timeout=0.2)
+
+            self.ensure_not_cancelled()
+            if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
+                raise RuntimeError(
+                    f"Whisperワーカープロセスが結果を返さずに終了しました。終了コード: {process.exitcode}"
+                )
+
+            with open(result_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            if not payload.get("ok"):
+                raise RuntimeError(payload.get("error") or "Whisperワーカープロセスでエラーが発生しました。")
+
+            return payload["result"]
+        finally:
+            self.clear_current_worker_process(process)
+            if process.is_alive():
+                self.terminate_worker_process(process)
+            self.remove_temp_file(result_path)
+
     def prepare_audio_for_diarization(self, filepath):
         if shutil.which("ffmpeg") is None:
             raise RuntimeError(
@@ -491,12 +673,8 @@ class Whisperapp:
         ]
 
         try:
-            result = subprocess.run(
+            result = self.run_cancellable_subprocess(
                 command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
             )
         except OSError as e:
             self.remove_temp_file(temp_path)
@@ -646,6 +824,7 @@ class Whisperapp:
             return
         self.is_closing = True
         self.cancel_event.set()
+        self.terminate_active_processes()
         self.cancel_pending_after_callbacks()
         self.stop_progress_animation()
         try:
@@ -885,12 +1064,8 @@ class Whisperapp:
 
     def run_ollama_list(self):
         # Ollamaサーバーの起動確認とローカルモデル一覧の取得
-        return subprocess.run(
+        return self.run_cancellable_subprocess(
             ["ollama", "list"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=self.lm_studio_check_timeout_seconds,
         )
 
@@ -1455,6 +1630,7 @@ class Whisperapp:
             self.status_label.configure(text="中止しています...")
             self.cancel_btn.configure(state="disabled")
             self.cancel_event.set()
+            self.terminate_active_processes()
 
     #実行処理フェーズ
     def run_process(self, task_config):
@@ -1492,12 +1668,11 @@ class Whisperapp:
                 "best_of": 1                            #メモリ節約のため候補数を1に設定
             }
             # Whisperで文字起こし
-            mlx_whisper = self.load_mlx_whisper()
-            whisper_result = mlx_whisper.transcribe(
+            whisper_result = self.run_mlx_whisper_transcribe(
                 filepath,
-                path_or_hf_repo=model_path,
-                initial_prompt=initial_prompt_str or None,
-                **whisper_options,
+                model_path,
+                initial_prompt_str or None,
+                whisper_options,
             )
             
             # 途中でキャンセルされていないか確認
@@ -1751,13 +1926,9 @@ class Whisperapp:
                     # Ollama CLIはmessagesを直接受け取らないため、プロンプト文字列に整形して標準入力で渡す
                     prompt = self.build_ollama_prompt(messages, ollama_model)
                     try:
-                        response = subprocess.run(
+                        response = self.run_cancellable_subprocess(
                             ["ollama", "run", ollama_model],
-                            input=prompt,
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
+                            input_text=prompt,
                             timeout=self.summary_timeout_seconds,
                         )
                     except subprocess.TimeoutExpired as e:
@@ -2111,6 +2282,7 @@ class Whisperapp:
                 messagebox.showerror("エラー", f"辞書の保存に失敗しました:\n{str(e)}")
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     root = ctk.CTk()
     app = Whisperapp(root)
     root.mainloop()

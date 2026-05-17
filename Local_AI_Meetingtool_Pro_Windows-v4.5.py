@@ -14,6 +14,7 @@ import gc
 import torch
 import openai
 import importlib
+import multiprocessing
 # Windows専用版のOS確認とOllama CLI連携で使用
 import platform
 import shutil
@@ -42,6 +43,146 @@ class LMStudioConnectionError(Exception):
 
 class OllamaConnectionError(Exception):
     pass
+
+def is_cuda_runtime_error_text(error):
+    error_text = str(error).lower()
+    cuda_markers = (
+        "cuda",
+        "cudnn",
+        "cublas",
+        "cudart",
+        "ctranslate2",
+        "gpu",
+        "nvidia",
+        "out of memory",
+        "no kernel image",
+        "invalid device",
+        "compute capability",
+        "driver version",
+        "not compiled with cuda",
+    )
+    return any(marker in error_text for marker in cuda_markers)
+
+def transcribe_with_faster_whisper_on_device(
+    filepath,
+    model_path,
+    initial_prompt,
+    whisper_options,
+    worker_config,
+    device,
+    allow_batched=True,
+):
+    from faster_whisper import WhisperModel as WorkerWhisperModel
+
+    try:
+        from faster_whisper import BatchedInferencePipeline as WorkerBatchedInferencePipeline
+    except ImportError:
+        WorkerBatchedInferencePipeline = None
+
+    compute_type = worker_config["compute_type"] if device == "cuda" else "int8"
+    model = WorkerWhisperModel(
+        model_path,
+        device=device,
+        compute_type=compute_type,
+        cpu_threads=worker_config["cpu_threads"],
+        num_workers=worker_config["num_workers"],
+    )
+
+    faster_whisper_options = dict(whisper_options)
+    if "logprob_threshold" in faster_whisper_options:
+        faster_whisper_options["log_prob_threshold"] = faster_whisper_options.pop("logprob_threshold")
+    faster_whisper_options["beam_size"] = worker_config["beam_size"]
+    faster_whisper_options["best_of"] = worker_config["best_of"]
+
+    use_batched = (
+        allow_batched
+        and worker_config["use_batched"]
+        and worker_config["batch_size"] > 1
+        and WorkerBatchedInferencePipeline is not None
+    )
+    if use_batched:
+        batched_model = WorkerBatchedInferencePipeline(model=model)
+        segments, info = batched_model.transcribe(
+            filepath,
+            batch_size=worker_config["batch_size"],
+            initial_prompt=initial_prompt or None,
+            **faster_whisper_options,
+        )
+    else:
+        segments, info = model.transcribe(
+            filepath,
+            initial_prompt=initial_prompt or None,
+            **faster_whisper_options,
+        )
+
+    segment_dicts = [
+        {"start": segment.start, "end": segment.end, "text": segment.text}
+        for segment in segments
+    ]
+    return {
+        "text": "".join(segment["text"] for segment in segment_dicts).strip(),
+        "segments": segment_dicts,
+        "language": getattr(info, "language", None),
+    }
+
+def faster_whisper_transcribe_worker(result_path, filepath, model_path, initial_prompt, whisper_options, worker_config):
+    try:
+        import torch as worker_torch
+        from faster_whisper import WhisperModel as WorkerWhisperModel
+
+        if WorkerWhisperModel is None:
+            raise ImportError()
+
+        requested_device = worker_config["device"]
+        cuda_available = False
+        try:
+            cuda_available = worker_torch.cuda.is_available()
+        except Exception:
+            cuda_available = False
+
+        device = "cpu" if requested_device == "cuda" and not cuda_available else requested_device
+        allow_batched = True
+        fallback_to_cpu = requested_device == "cuda" and device == "cpu"
+
+        try:
+            result = transcribe_with_faster_whisper_on_device(
+                filepath,
+                model_path,
+                initial_prompt,
+                whisper_options,
+                worker_config,
+                device,
+                allow_batched=allow_batched and not fallback_to_cpu,
+            )
+        except Exception as e:
+            if device == "cuda" and is_cuda_runtime_error_text(e):
+                fallback_to_cpu = True
+                result = transcribe_with_faster_whisper_on_device(
+                    filepath,
+                    model_path,
+                    initial_prompt,
+                    whisper_options,
+                    worker_config,
+                    "cpu",
+                    allow_batched=False,
+                )
+            else:
+                raise
+
+        payload = {"ok": True, "result": result, "fallback_to_cpu": fallback_to_cpu}
+    except ImportError:
+        payload = {
+            "ok": False,
+            "error": (
+                "Windowsで文字起こしするには faster-whisper が必要です。\n"
+                "requirements-windows.txt を使って依存関係をインストールしてください。"
+            ),
+        }
+    except BaseException as e:
+        payload = {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
 
 # --- 環境設定 ---
 os.environ["HF_HUB_OFFLINE"] = "0"
@@ -96,6 +237,9 @@ class Whisperapp:
         self.processing_thread = None
         self.cancel_event = threading.Event()
         self.active_task = None
+        self.current_subprocess = None
+        self.current_worker_process = None
+        self.process_lock = threading.Lock()
         self.keyring = self.load_keyring()
         self.keyring_service = "Local AI MeetingTool Pro Ver.4"
         self.keyring_username = "huggingface_token"
@@ -850,6 +994,7 @@ class Whisperapp:
             return
         self.is_closing = True
         self.cancel_event.set()
+        self.terminate_active_processes()
         self.cancel_pending_after_callbacks()
         self.stop_progress_animation()
         try:
@@ -1089,12 +1234,8 @@ class Whisperapp:
 
     def run_ollama_list(self):
         # Ollamaサーバーの起動確認とローカルモデル一覧の取得
-        return subprocess.run(
+        return self.run_cancellable_subprocess(
             ["ollama", "list"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=self.lm_studio_check_timeout_seconds,
         )
 
@@ -1648,12 +1789,164 @@ class Whisperapp:
             self.status_label.configure(text="中止しています...")
             self.cancel_btn.configure(state="disabled")
             self.cancel_event.set()
-            self.cleanup_resources()
+            self.terminate_active_processes()
 
     #実行処理フェーズ
     def cleanup_resources(self):
         gc.collect()
         self.clear_torch_cache()
+
+    def set_current_subprocess(self, process):
+        with self.process_lock:
+            self.current_subprocess = process
+
+    def clear_current_subprocess(self, process):
+        with self.process_lock:
+            if self.current_subprocess is process:
+                self.current_subprocess = None
+
+    def set_current_worker_process(self, process):
+        with self.process_lock:
+            self.current_worker_process = process
+
+    def clear_current_worker_process(self, process):
+        with self.process_lock:
+            if self.current_worker_process is process:
+                self.current_worker_process = None
+
+    def terminate_subprocess(self, process):
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+        except Exception as e:
+            logging.warning(f"実行中プロセスの停止に失敗しました: {e}")
+
+    def terminate_worker_process(self, process):
+        if process is None:
+            return
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join(timeout=3)
+        except Exception as e:
+            logging.warning(f"文字起こしワーカープロセスの停止に失敗しました: {e}")
+
+    def terminate_active_processes(self):
+        with self.process_lock:
+            current_subprocess = self.current_subprocess
+            current_worker_process = self.current_worker_process
+        self.terminate_subprocess(current_subprocess)
+        self.terminate_worker_process(current_worker_process)
+
+    def run_cancellable_subprocess(self, command, input_text=None, timeout=None):
+        self.ensure_not_cancelled()
+        creationflags = 0
+        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags = subprocess.CREATE_NO_WINDOW
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+        )
+        self.set_current_subprocess(process)
+        start_time = time.monotonic()
+        communicate_input = input_text
+
+        try:
+            while True:
+                self.ensure_not_cancelled()
+                if timeout is not None and time.monotonic() - start_time > timeout:
+                    self.terminate_subprocess(process)
+                    raise subprocess.TimeoutExpired(command, timeout)
+
+                try:
+                    stdout, stderr = process.communicate(input=communicate_input, timeout=0.2)
+                    self.ensure_not_cancelled()
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    communicate_input = None
+        except CancelledError:
+            self.terminate_subprocess(process)
+            raise
+        finally:
+            self.clear_current_subprocess(process)
+
+    def get_whisper_worker_config(self):
+        device = self.get_windows_whisper_device()
+        if self.windows_whisper_device == "cuda" and device == "cpu":
+            self.notify_cuda_fallback("文字起こし")
+        return {
+            "device": device,
+            "compute_type": self.windows_whisper_compute_type,
+            "cpu_threads": self.windows_whisper_cpu_threads,
+            "num_workers": self.windows_whisper_num_workers,
+            "beam_size": self.windows_whisper_beam_size,
+            "best_of": self.windows_whisper_best_of,
+            "batch_size": self.windows_whisper_batch_size,
+            "use_batched": self.windows_whisper_use_batched,
+        }
+
+    def run_faster_whisper_transcribe(self, filepath, model_path, initial_prompt, whisper_options):
+        result_file = tempfile.NamedTemporaryFile(
+            prefix="meetingtool_whisper_",
+            suffix=".json",
+            delete=False,
+        )
+        result_path = result_file.name
+        result_file.close()
+
+        worker_config = self.get_whisper_worker_config()
+        ctx = multiprocessing.get_context("spawn")
+        process = ctx.Process(
+            target=faster_whisper_transcribe_worker,
+            args=(result_path, filepath, model_path, initial_prompt, whisper_options, worker_config),
+        )
+        process.daemon = True
+        self.set_current_worker_process(process)
+
+        try:
+            process.start()
+            while process.is_alive():
+                if self.cancel_event.is_set():
+                    self.terminate_worker_process(process)
+                    raise CancelledError()
+                process.join(timeout=0.2)
+
+            self.ensure_not_cancelled()
+            if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
+                raise RuntimeError(
+                    f"Whisperワーカープロセスが結果を返さずに終了しました。終了コード: {process.exitcode}"
+                )
+
+            with open(result_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            if not payload.get("ok"):
+                raise RuntimeError(payload.get("error") or "Whisperワーカープロセスでエラーが発生しました。")
+            if payload.get("fallback_to_cpu") and self.windows_whisper_device == "cuda":
+                self.notify_cuda_fallback("文字起こし")
+
+            return payload["result"]
+        finally:
+            self.clear_current_worker_process(process)
+            if process.is_alive():
+                self.terminate_worker_process(process)
+            self.remove_temp_file(result_path)
 
     def prepare_audio_for_diarization(self, filepath):
         if shutil.which("ffmpeg") is None:
@@ -1691,12 +1984,8 @@ class Whisperapp:
         ]
 
         try:
-            result = subprocess.run(
+            result = self.run_cancellable_subprocess(
                 command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
             )
         except OSError as e:
             self.remove_temp_file(temp_path)
@@ -1751,7 +2040,7 @@ class Whisperapp:
                 "best_of": 3                            #3つの候補から最も適切なものを選択
             }
             # Windows専用版ではfaster-whisperで文字起こし
-            whisper_result = self.transcribe_with_whisper(
+            whisper_result = self.run_faster_whisper_transcribe(
                 filepath,
                 model_path,
                 initial_prompt_str,
@@ -2005,13 +2294,9 @@ class Whisperapp:
                     # Ollama CLIはmessagesを直接受け取らないため、プロンプト文字列に整形して標準入力で渡す
                     prompt = self.build_ollama_prompt(messages, ollama_model)
                     try:
-                        response = subprocess.run(
+                        response = self.run_cancellable_subprocess(
                             ["ollama", "run", ollama_model],
-                            input=prompt,
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
+                            input_text=prompt,
                             timeout=self.summary_timeout_seconds,
                         )
                     except subprocess.TimeoutExpired as e:
@@ -2370,6 +2655,7 @@ class Whisperapp:
                 messagebox.showerror("エラー", f"辞書の保存に失敗しました:\n{str(e)}")
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     root = ctk.CTk()
     app = Whisperapp(root)
     root.mainloop()
