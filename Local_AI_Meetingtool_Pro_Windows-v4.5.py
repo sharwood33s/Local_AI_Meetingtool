@@ -14,6 +14,7 @@ import gc
 import torch
 import openai
 import importlib
+import sys
 # Windows専用版のOS確認とOllama CLI連携で使用
 import platform
 import shutil
@@ -22,6 +23,43 @@ import time
 from datetime import datetime #自動保存用のタイムスタンプ取得
 
 logging.basicConfig(level=logging.INFO, filename='app.log', encoding='utf-8')
+
+CUDA_DLL_DIRECTORY_HANDLES = []
+
+def add_cuda_dll_directories():
+    if platform.system() != "Windows":
+        return
+
+    # faster-whisperのGPU実行に必要なCUDA DLLを、起動方法に関係なく見つけられるようにする
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    site_packages_dirs = [
+        os.path.join(sys.prefix, "Lib", "site-packages"),
+        os.path.join(script_dir, ".venv", "Lib", "site-packages"),
+    ]
+
+    candidates = []
+    for site_packages_dir in site_packages_dirs:
+        candidates.append(os.path.join(site_packages_dir, "ctranslate2"))
+
+        nvidia_dir = os.path.join(site_packages_dir, "nvidia")
+        if os.path.isdir(nvidia_dir):
+            for package_name in os.listdir(nvidia_dir):
+                candidates.append(os.path.join(nvidia_dir, package_name, "bin"))
+
+    for dll_dir in candidates:
+        if not os.path.isdir(dll_dir):
+            continue
+        # ctranslate2側がPATHからDLLを探す場合があるため、add_dll_directoryと両方で登録する
+        current_path = os.environ.get("PATH", "")
+        if dll_dir not in current_path.split(os.pathsep):
+            os.environ["PATH"] = dll_dir + os.pathsep + current_path
+        try:
+            if hasattr(os, "add_dll_directory"):
+                CUDA_DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(dll_dir))
+        except OSError as e:
+            logging.warning(f"Failed to add CUDA DLL directory {dll_dir}: {e}")
+
+add_cuda_dll_directories()
 
 try:
     from faster_whisper import WhisperModel
@@ -32,6 +70,11 @@ try:
     from faster_whisper import BatchedInferencePipeline
 except ImportError:
     BatchedInferencePipeline = None
+
+try:
+    import ctranslate2
+except ImportError:
+    ctranslate2 = None
 
 class CancelledError(Exception):
     pass
@@ -87,6 +130,8 @@ class Whisperapp:
         self.windows_whisper_best_of = 3
         self.windows_whisper_batch_size = 16
         self.windows_whisper_use_batched = True
+        # VADが音声全体を無音扱いする環境があるため、Windows版では既定で無効にする
+        self.windows_whisper_vad_filter = False
         self.whisper_model_cache = {}
         self.summary_timeout_seconds = 360 #要約する際のタイムアウト時間
         self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
@@ -362,9 +407,22 @@ class Whisperapp:
         return "cpu"
 
     def get_windows_whisper_device(self):
-        if self.windows_whisper_device == "cuda" and not torch.cuda.is_available():
+        if self.windows_whisper_device != "cuda":
+            return self.windows_whisper_device
+
+        # Windows版の文字起こしはPyTorchではなくctranslate2がGPUを使うため、こちらでCUDAを判定する
+        if ctranslate2 is None:
+            logging.warning("ctranslate2 is not available. Falling back to CPU for faster-whisper.")
             return "cpu"
-        return self.windows_whisper_device
+
+        try:
+            if ctranslate2.get_cuda_device_count() > 0:
+                return "cuda"
+        except Exception as e:
+            logging.warning(f"Failed to check ctranslate2 CUDA devices: {e}")
+
+        logging.warning("No ctranslate2 CUDA device found. Falling back to CPU for faster-whisper.")
+        return "cpu"
 
     def get_cached_whisper_model(self, model_path, device, compute_type):
         cache_key = (model_path, device, compute_type, self.windows_whisper_cpu_threads, self.windows_whisper_num_workers)
@@ -399,8 +457,17 @@ class Whisperapp:
             faster_whisper_options["log_prob_threshold"] = faster_whisper_options.pop("logprob_threshold")
         faster_whisper_options["beam_size"] = self.windows_whisper_beam_size
         faster_whisper_options["best_of"] = self.windows_whisper_best_of
+        faster_whisper_options.setdefault("vad_filter", self.windows_whisper_vad_filter)
 
-        if self.windows_whisper_use_batched and self.windows_whisper_batch_size > 1 and BatchedInferencePipeline is not None:
+        # BatchedInferencePipelineはVAD前提のため、VAD無効時は通常のtranscribeへ回す
+        use_batched = (
+            self.windows_whisper_use_batched
+            and self.windows_whisper_batch_size > 1
+            and BatchedInferencePipeline is not None
+            and faster_whisper_options.get("vad_filter", False)
+        )
+
+        if use_batched:
             batched_model = BatchedInferencePipeline(model=model)
             segments, info = batched_model.transcribe(
                 filepath,
@@ -412,14 +479,45 @@ class Whisperapp:
             segments, info = model.transcribe(
                 filepath,
                 initial_prompt=initial_prompt or None,
+                # VAD無効時でも音声全体を処理対象にする
+                clip_timestamps="0",
                 **faster_whisper_options,
             )
         segment_dicts = [
             {"start": segment.start, "end": segment.end, "text": segment.text}
             for segment in segments
         ]
+        text = "".join(segment["text"] for segment in segment_dicts).strip()
+
+        if not text:
+            # しきい値が厳しすぎて空になるケースに備え、通常モードで1回だけ救済する
+            logging.warning("Whisper returned empty text. Retrying with relaxed non-batched options.")
+            retry_options = dict(faster_whisper_options)
+            retry_options.update({
+                "vad_filter": False,
+                "condition_on_previous_text": True,
+                "compression_ratio_threshold": None,
+                "no_speech_threshold": None,
+                "log_prob_threshold": None,
+            })
+            retry_segments, retry_info = model.transcribe(
+                filepath,
+                initial_prompt=initial_prompt or None,
+                clip_timestamps="0",
+                **retry_options,
+            )
+            retry_segment_dicts = [
+                {"start": segment.start, "end": segment.end, "text": segment.text}
+                for segment in retry_segments
+            ]
+            retry_text = "".join(segment["text"] for segment in retry_segment_dicts).strip()
+            if retry_text:
+                segment_dicts = retry_segment_dicts
+                text = retry_text
+                info = retry_info
+
         return {
-            "text": "".join(segment["text"] for segment in segment_dicts).strip(),
+            "text": text,
             "segments": segment_dicts,
             "language": getattr(info, "language", None),
         }
@@ -466,6 +564,7 @@ class Whisperapp:
             "windows_whisper_best_of": self.windows_whisper_best_of,
             "windows_whisper_batch_size": self.windows_whisper_batch_size,
             "windows_whisper_use_batched": self.windows_whisper_use_batched,
+            "windows_whisper_vad_filter": self.windows_whisper_vad_filter,
             # 処理性能に関わる値は、画面項目ではなくwhisper_config.jsonから調整する
             "batch_size": self.diarization_batch_size,
             "context_length": self.context_length,
@@ -660,6 +759,11 @@ class Whisperapp:
             config,
             ("windows_whisper_use_batched", "whisper_use_batched"),
             self.windows_whisper_use_batched,
+        )
+        self.windows_whisper_vad_filter = self.get_bool_config(
+            config,
+            ("windows_whisper_vad_filter", "whisper_vad_filter"),
+            self.windows_whisper_vad_filter,
         )
 
     def load_config(self):
@@ -1559,6 +1663,14 @@ class Whisperapp:
                 final_text = whisper_result["text"].strip()
 
             final_text = self.clean_repeated_text(final_text)
+            if not final_text.strip():
+                # 空の結果を成功扱いすると原因が見えないため、明示的にエラーとして止める
+                raise RuntimeError(
+                    "文字起こし結果が空でした。\n"
+                    "音声が小さい、無音として判定された、または音声形式を読み取れなかった可能性があります。\n"
+                    "Windows版ではVADを既定で無効にしました。もう一度実行してください。"
+                )
+
             auto_mask_counts = None
             if task_config["privacy_mask_auto"]:
                 final_text, auto_mask_counts = self.mask_privacy_text(
@@ -1578,6 +1690,8 @@ class Whisperapp:
         #エラー表示
         except Exception as e:
             self.cleanup_resources() #メモリ解放
+            # 画面には短いエラー、app.logには追跡用のスタックトレースを残す
+            logging.exception("Transcription task failed")
             error_msg = f"処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("エラーが発生しました"))
