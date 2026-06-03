@@ -1,5 +1,4 @@
-<img width="1112" height="944" alt="Local AI Meetingtool screenshot" src="https://github.com/user-attachments/assets/7f26a098-8aad-48ab-bb75-70cce28e73a9" />
-
+<img width="1312" height="1144" alt="LocalAIMeetingTool-v4 5_SS" src="https://github.com/user-attachments/assets/25182ae0-4cc6-45d8-9475-b81a513c9638" />
 # Local AI Meetingtool
 
 ローカル実行を前提にした、音声・動画の文字起こし、話者分離、要約アプリです。
@@ -125,7 +124,7 @@ Ollama CLIを使う場合:
 
 設定ファイル:
 
-- macOS版設定: `whisper_config.json`
+- macOS版設定: `whisper_config_macos.json`
 - Windows版設定: `whisper_config_windows.json`
 
 Windows版では `whisper_config_windows.json` を使用します。処理性能に関わる値はこのファイルで調整できます。
@@ -152,6 +151,7 @@ Windows版では `whisper_config_windows.json` を使用します。処理性能
 - `windows_whisper_device`: `cuda` または `cpu` を指定します。
 - `windows_whisper_compute_type`: CUDA使用時の計算型です。
 - `windows_whisper_batch_size`: Windows版のbatched inferenceのバッチサイズです。
+- CUDAが検出できない場合やCUDA実行時に失敗した場合、Windows版のWhisperは自動的にCPU `int8` へフォールバックします。
 
 ## Local Files
 

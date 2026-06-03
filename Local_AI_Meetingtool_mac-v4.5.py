@@ -1,7 +1,7 @@
-#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio使用）
-#使用時はLM Studioでローカルサーバーを起動し、llamaを使用すること
-#Windowsではfaster-whisperを使用して動作
-#7800X3D/RTX5070Ti-16GBに合わせた設定
+#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio / Ollama CLI使用）
+#使用時はLM Studioでローカルサーバーを起動するか、Ollama CLIでモデルを用意すること
+#Windowsでは動作しないので注意
+#M2チップ16GBに合わせた設定（メモリ最適化済み）
 import customtkinter as ctk
 from tkinter import TclError, filedialog, messagebox
 import threading
@@ -14,68 +14,13 @@ import gc
 import torch
 import openai
 import importlib
-import sys
-# Windows専用版のOS確認とOllama CLI連携で使用
+import multiprocessing
 import platform
 import shutil
 import subprocess
 import tempfile
 import time
 from datetime import datetime #自動保存用のタイムスタンプ取得
-
-logging.basicConfig(level=logging.INFO, filename='app.log', encoding='utf-8')
-
-CUDA_DLL_DIRECTORY_HANDLES = []
-
-def add_cuda_dll_directories():
-    if platform.system() != "Windows":
-        return
-
-    # faster-whisperのGPU実行に必要なCUDA DLLを、起動方法に関係なく見つけられるようにする
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    site_packages_dirs = [
-        os.path.join(sys.prefix, "Lib", "site-packages"),
-        os.path.join(script_dir, ".venv", "Lib", "site-packages"),
-    ]
-
-    candidates = []
-    for site_packages_dir in site_packages_dirs:
-        candidates.append(os.path.join(site_packages_dir, "ctranslate2"))
-
-        nvidia_dir = os.path.join(site_packages_dir, "nvidia")
-        if os.path.isdir(nvidia_dir):
-            for package_name in os.listdir(nvidia_dir):
-                candidates.append(os.path.join(nvidia_dir, package_name, "bin"))
-
-    for dll_dir in candidates:
-        if not os.path.isdir(dll_dir):
-            continue
-        # ctranslate2側がPATHからDLLを探す場合があるため、add_dll_directoryと両方で登録する
-        current_path = os.environ.get("PATH", "")
-        if dll_dir not in current_path.split(os.pathsep):
-            os.environ["PATH"] = dll_dir + os.pathsep + current_path
-        try:
-            if hasattr(os, "add_dll_directory"):
-                CUDA_DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(dll_dir))
-        except OSError as e:
-            logging.warning(f"Failed to add CUDA DLL directory {dll_dir}: {e}")
-
-add_cuda_dll_directories()
-
-try:
-    from faster_whisper import WhisperModel
-except ImportError:
-    WhisperModel = None
-
-try:
-    from faster_whisper import BatchedInferencePipeline
-except ImportError:
-    BatchedInferencePipeline = None
-
-try:
-    import ctranslate2
-except ImportError:
-    ctranslate2 = None
 
 class CancelledError(Exception):
     pass
@@ -86,140 +31,48 @@ class LMStudioConnectionError(Exception):
 class OllamaConnectionError(Exception):
     pass
 
-def is_cuda_runtime_error_text(error):
-    error_text = str(error).lower()
-    cuda_markers = (
-        "cuda",
-        "cudnn",
-        "cublas",
-        "cudart",
-        "ctranslate2",
-        "gpu",
-        "nvidia",
-        "out of memory",
-        "no kernel image",
-        "invalid device",
-        "compute capability",
-        "driver version",
-        "not compiled with cuda",
-    )
-    return any(marker in error_text for marker in cuda_markers)
-
-def transcribe_with_faster_whisper_on_device(
-    filepath,
-    model_path,
-    initial_prompt,
-    whisper_options,
-    worker_config,
-    device,
-    allow_batched=True,
-):
-    from faster_whisper import WhisperModel as WorkerWhisperModel
-
-    try:
-        from faster_whisper import BatchedInferencePipeline as WorkerBatchedInferencePipeline
-    except ImportError:
-        WorkerBatchedInferencePipeline = None
-
-    compute_type = worker_config["compute_type"] if device == "cuda" else "int8"
-    model = WorkerWhisperModel(
-        model_path,
-        device=device,
-        compute_type=compute_type,
-        cpu_threads=worker_config["cpu_threads"],
-        num_workers=worker_config["num_workers"],
-    )
-
-    faster_whisper_options = dict(whisper_options)
-    if "logprob_threshold" in faster_whisper_options:
-        faster_whisper_options["log_prob_threshold"] = faster_whisper_options.pop("logprob_threshold")
-    faster_whisper_options["beam_size"] = worker_config["beam_size"]
-    faster_whisper_options["best_of"] = worker_config["best_of"]
-
-    use_batched = (
-        allow_batched
-        and worker_config["use_batched"]
-        and worker_config["batch_size"] > 1
-        and WorkerBatchedInferencePipeline is not None
-    )
-    if use_batched:
-        batched_model = WorkerBatchedInferencePipeline(model=model)
-        segments, info = batched_model.transcribe(
-            filepath,
-            batch_size=worker_config["batch_size"],
-            initial_prompt=initial_prompt or None,
-            **faster_whisper_options,
-        )
-    else:
-        segments, info = model.transcribe(
-            filepath,
-            initial_prompt=initial_prompt or None,
-            **faster_whisper_options,
-        )
-
-    segment_dicts = [
-        {"start": segment.start, "end": segment.end, "text": segment.text}
-        for segment in segments
-    ]
-    return {
-        "text": "".join(segment["text"] for segment in segment_dicts).strip(),
-        "segments": segment_dicts,
-        "language": getattr(info, "language", None),
-    }
-
-def faster_whisper_transcribe_worker(result_path, filepath, model_path, initial_prompt, whisper_options, worker_config):
-    try:
-        import torch as worker_torch
-        from faster_whisper import WhisperModel as WorkerWhisperModel
-
-        if WorkerWhisperModel is None:
-            raise ImportError()
-
-        requested_device = worker_config["device"]
-        cuda_available = False
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "item"):
         try:
-            cuda_available = worker_torch.cuda.is_available()
+            return value.item()
         except Exception:
-            cuda_available = False
+            pass
+    return str(value)
 
-        device = "cpu" if requested_device == "cuda" and not cuda_available else requested_device
-        allow_batched = True
-        fallback_to_cpu = requested_device == "cuda" and device == "cpu"
-
-        try:
-            result = transcribe_with_faster_whisper_on_device(
-                filepath,
-                model_path,
-                initial_prompt,
-                whisper_options,
-                worker_config,
-                device,
-                allow_batched=allow_batched and not fallback_to_cpu,
-            )
-        except Exception as e:
-            if device == "cuda" and is_cuda_runtime_error_text(e):
-                fallback_to_cpu = True
-                result = transcribe_with_faster_whisper_on_device(
-                    filepath,
-                    model_path,
-                    initial_prompt,
-                    whisper_options,
-                    worker_config,
-                    "cpu",
-                    allow_batched=False,
-                )
-            else:
-                raise
-
-        payload = {"ok": True, "result": result, "fallback_to_cpu": fallback_to_cpu}
-    except ImportError:
+def mlx_whisper_transcribe_worker(result_path, filepath, model_path, initial_prompt, whisper_options):
+    try:
+        mlx_whisper = importlib.import_module("mlx_whisper")
+        whisper_result = mlx_whisper.transcribe(
+            filepath,
+            path_or_hf_repo=model_path,
+            initial_prompt=initial_prompt,
+            **whisper_options,
+        )
+        payload = {"ok": True, "result": make_json_safe(whisper_result)}
+    except ImportError as e:
         payload = {
             "ok": False,
             "error": (
-                "Windowsで文字起こしするには faster-whisper が必要です。\n"
-                "requirements-windows.txt を使って依存関係をインストールしてください。"
+                "macOSで文字起こしするには mlx-whisper が必要です。\n"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
             ),
         }
+    except RuntimeError as e:
+        error_text = str(e).lower()
+        if "metal" in error_text or "load_device" in error_text or "gpu" in error_text:
+            error_message = (
+                "MLX/Metalデバイスを利用できないため、文字起こしを開始できません。\n"
+                "Apple Silicon Macの通常ログイン環境で実行してください。"
+            )
+        else:
+            error_message = str(e)
+        payload = {"ok": False, "error": error_message}
     except BaseException as e:
         payload = {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
 
@@ -257,23 +110,19 @@ class Whisperapp:
         r"^\s*(?:要約結果|要約|Summary|Final answer|回答)\s*[:：]\s*",
         re.IGNORECASE,
     )
-    WINDOWS_UI_FONT = "Yu Gothic UI"
-    WINDOWS_TEXT_FONT = "MS Gothic"
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Local AI MeetingTool Pro Ver.4.5 - 文字起こし & 要約")
+        self.root.title("Local AI MeetingTool Ver.4.5 - 文字起こし & 要約")
         self.root.geometry("1200x1000")
         self.root.configure(fg_color="#FFFFFF")
-        if platform.system() != "Windows":
-            raise RuntimeError("Local_AI_Meetingtool_Pro_Windows-v4.5.py is Windows-only.")
         self.is_closing = False
         self.after_ids = set()
 
-        # Windows標準フォントを使用
-        self.font_title = (self.WINDOWS_UI_FONT, 15, "bold")
-        self.font_main = (self.WINDOWS_UI_FONT, 13)
-        self.font_text = (self.WINDOWS_TEXT_FONT, 13)
+        # Mac用フォント設定
+        self.font_title = ("Hiragino Sans", 15, "bold")
+        self.font_main = ("Hiragino Sans", 13)
+        self.font_text = ("Menlo", 13)
 
         self.diarization_pipeline = None
         self.processing_thread = None
@@ -282,25 +131,15 @@ class Whisperapp:
         self.current_subprocess = None
         self.current_worker_process = None
         self.process_lock = threading.Lock()
+        self.mlx_whisper_module = None
         self.keyring = self.load_keyring()
-        self.keyring_service = "Local AI MeetingTool Pro Ver.4"
+        self.keyring_service = "Local AI MeetingTool Ver.4"
         self.keyring_username = "huggingface_token"
-        self.diarization_batch_size = 192 # 話者分離(pyannote)のバッチサイズ
-        self.context_length = 8000 # 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
-        self.windows_whisper_device = "cuda"
-        self.windows_whisper_compute_type = "float16"
-        self.windows_whisper_cpu_threads = 8
-        self.windows_whisper_num_workers = 1
-        self.windows_whisper_beam_size = 5
-        self.windows_whisper_best_of = 3
-        self.windows_whisper_batch_size = 16
-        self.windows_whisper_use_batched = True
-        # VADが音声全体を無音扱いする環境があるため、Windows版では既定で無効にする
-        self.windows_whisper_vad_filter = False
-        self.whisper_model_cache = {}
-        self.summary_timeout_seconds = 360 #要約する際のタイムアウト時間
-        self.summary_chunk_chars = 8000 # 要約する文章を分割しLM Studioに渡す
-        self.summary_merge_chunk_chars = 6000 # 中間要約を統合する際の入力上限
+        self.diarization_batch_size = 64 # M2チップ16GB向けの話者分離(pyannote)バッチサイズ
+        self.context_length = 4000 # M2チップ16GB向けにLM Studioへ渡す1チャンクあたりの目安文字数
+        self.summary_timeout_seconds = 1800 #要約する際のタイムアウト時間
+        self.summary_chunk_chars = 4000 # 要約する文章を分割しLM Studioに渡す（メモリ節約のため小さく設定）
+        self.summary_merge_chunk_chars = 3000 # 中間要約を統合する際の入力上限
         self.summary_merge_group_items = 5 # 中間要約を一度に統合する最大件数
         self.summary_intermediate_target_chars = 2500 # 階層統合中の中間要約目安
         self.summary_final_target_chars = 7000 # 最終要約の目安
@@ -309,7 +148,7 @@ class Whisperapp:
         self.summary_max_merge_levels = 8
         self.lm_studio_base_url = "http://localhost:1234/v1"
         self.lm_studio_api_key = "lm-studio"
-        self.lm_studio_check_timeout_seconds = 5
+        self.lm_studio_check_timeout_seconds = 5 # 起動確認だけなのでM2でも負荷をかけない
         # 要約バックエンドは従来のLM Studioに加えてOllama CLIを選択可能
         self.summary_backends = ["LM Studio", "Ollama CLI"]
         self.default_summary_backend = "LM Studio"
@@ -321,7 +160,13 @@ class Whisperapp:
         self.summary_text = ""
 
 
-        self.models = self.get_whisper_models()
+        self.models = {
+           "Large v3（最高精度・低速）": "mlx-community/whisper-large-v3-mlx", 
+           "Turbo（高速・高精度）": "mlx-community/whisper-large-v3-turbo",
+            "Small（バランス）": "mlx-community/whisper-small-mlx",
+            "Base（軽量・高速）": "mlx-community/whisper-base-mlx",
+            "Tiny（最速・低精度）": "mlx-community/whisper-tiny-mlx"
+        }
 
         self.summary_prompts = {
             "標準要約（事実のみ簡潔に）": "あなたは優秀なアシスタントです。以下の文字起こしテキストを要約してください。不要な相槌や重複した議論は削り、事実のみを正確にまとめてください。",
@@ -348,7 +193,7 @@ class Whisperapp:
         self.select_btn.pack(fill=ctk.X)
 
         self.file_path_label = ctk.CTkLabel(self.main_frame, text="ファイルが選択されていません", 
-                                            text_color="#8E8E93", font=(self.font_main[0], 12))
+                                            text_color="#8E8E93", font=("Hiragino Sans", 12))
         self.file_path_label.pack(pady=(2, 10))
 
         # 2. 設定エリア
@@ -363,7 +208,7 @@ class Whisperapp:
 
         # モデル選択
         ctk.CTkLabel(self.configure_frame, text="使用するAIモデル", font=self.font_main).grid(row=1, column=0, padx=15, pady=5, sticky="w")
-        self.model_var = ctk.StringVar(value="Large v3（最高精度・低速）")
+        self.model_var = ctk.StringVar(value="Turbo（高速・高精度）")  # M2チップ16GB向けのデフォルト
         self.model_menu = ctk.CTkComboBox(self.configure_frame, values=list(self.models.keys()), 
                                           variable=self.model_var, width=350, corner_radius=8)
         self.model_menu.grid(row=1, column=1, padx=15, pady=5, sticky="w")
@@ -485,11 +330,11 @@ class Whisperapp:
         self.run_frame.pack(fill=ctk.X, pady=5)
 
         self.run_btn = ctk.CTkButton(self.run_frame, text="文字起こしを開始する", command=self.start_thread, state="disabled",
-                                     height=45, corner_radius=22, font=self.font_title, fg_color="#007AFF", hover_color="#005BB5")
+                                     height=45, corner_radius=22, font=("Hiragino Sans", 15, "bold"), fg_color="#007AFF", hover_color="#005BB5")
         self.run_btn.pack(side=ctk.LEFT, expand=True, fill=ctk.X, padx=(0, 5))
 
         self.cancel_btn = ctk.CTkButton(self.run_frame, text="中止", command=self.cancel_process, state="disabled", width=80,
-                                     height=45, corner_radius=22, font=self.font_title, text_color="#FFFFFF", fg_color="#FF3B30", hover_color="#D70015")
+                                     height=45, corner_radius=22, font=("Hiragino Sans", 15, "bold"), text_color="#FFFFFF", fg_color="#FF3B30", hover_color="#D70015")
         self.cancel_btn.pack(side=ctk.LEFT, padx=(5, 0))
 
         # 結果表示エリア
@@ -544,252 +389,17 @@ class Whisperapp:
         self.summarize_btn.pack(side=ctk.LEFT, padx=(0, 5), expand=True, fill=ctk.X)
 
         # ステータスバー（一番下に固定）
-        self.status_label = ctk.CTkLabel(root, text="準備完了", fg_color="#F5F5F7", height=25, font=(self.font_main[0], 11))
+        self.status_label = ctk.CTkLabel(root, text="準備完了", fg_color="#F5F5F7", height=25, font=("Hiragino Sans", 11))
         self.status_label.pack(side=ctk.BOTTOM, fill=ctk.X)
         self.progress = ctk.CTkProgressBar(root, height=4, corner_radius=0, fg_color="#E5E5E7", progress_color="#007AFF")
         self.progress.pack(side=ctk.BOTTOM, fill=ctk.X)
         self.progress.set(0)
 
         self.filepath = ""
-        self.legacy_config_filepath = "whisper_config.json"
-        self.config_filepath = "whisper_config_windows.json"
+        self.config_filepath = "whisper_config.json"
         
         self.load_config()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-    def get_whisper_models(self):
-        return {
-           "Large v3（最高精度・低速）": "large-v3",
-           "Turbo（高速・高精度）": "large-v3-turbo",
-            "Small（バランス）": "small",
-            "Base（軽量・高速）": "base",
-            "Tiny（最速・低精度）": "tiny"
-        }
-
-    def get_torch_accelerator(self):
-        if self.is_cuda_available():
-            return "cuda"
-        return "cpu"
-
-    # CUDAが使用可能かチェック
-    def is_cuda_available(self):
-        try:
-            return torch.cuda.is_available()
-        except Exception as e:
-            logging.warning(f"CUDAの利用可否チェックに失敗しました: {e}")
-            return False
-
-    def is_cuda_runtime_error(self, error):
-        error_text = str(error).lower()
-        cuda_markers = (
-            "cuda",
-            "cudnn",
-            "cublas",
-            "cudart",
-            "ctranslate2",
-            "gpu",
-            "nvidia",
-            "out of memory",
-            "no kernel image",
-            "invalid device",
-            "compute capability",
-            "driver version",
-            "not compiled with cuda",
-        )
-        return any(marker in error_text for marker in cuda_markers)
-
-    # CUDAが使えない場合はCPUで処理
-    def notify_cuda_fallback(self, task_label):
-        self.safe_after(lambda: self.status_label.configure(
-            text=f"CUDAが使えないためCPUで{task_label}を続行します..."
-        ))
-
-    def get_windows_whisper_device(self):
-        if self.windows_whisper_device != "cuda":
-            return self.windows_whisper_device
-
-        # Windows版の文字起こしはPyTorchではなくctranslate2がGPUを使うため、こちらでCUDAを判定する
-        if ctranslate2 is None:
-            logging.warning("ctranslate2 is not available. Falling back to CPU for faster-whisper.")
-            return "cpu"
-
-        try:
-            if ctranslate2.get_cuda_device_count() > 0:
-                return "cuda"
-        except Exception as e:
-            logging.warning(f"Failed to check ctranslate2 CUDA devices: {e}")
-
-        logging.warning("No ctranslate2 CUDA device found. Falling back to CPU for faster-whisper.")
-        return "cpu"
-
-    def get_cached_whisper_model(self, model_path, device, compute_type):
-        cache_key = (model_path, device, compute_type, self.windows_whisper_cpu_threads, self.windows_whisper_num_workers)
-        if cache_key not in self.whisper_model_cache:
-            self.whisper_model_cache.clear()
-            self.whisper_model_cache[cache_key] = WhisperModel(
-                model_path,
-                device=device,
-                compute_type=compute_type,
-                cpu_threads=self.windows_whisper_cpu_threads,
-                num_workers=self.windows_whisper_num_workers,
-            )
-        return self.whisper_model_cache[cache_key]
-
-    def clear_torch_cache(self):
-        if self.is_cuda_available():
-            try:
-                torch.cuda.empty_cache()
-            except Exception as e:
-                logging.warning(f"CUDAキャッシュの解放に失敗しました: {e}")
-
-    def move_diarization_pipeline_to_best_device(self):
-        accelerator = self.get_torch_accelerator()
-        if accelerator == "cpu" or not hasattr(self.diarization_pipeline, "to"):
-            return "cpu"
-
-        try:
-            self.diarization_pipeline.to(torch.device(accelerator))
-            return accelerator
-        except Exception as e:
-            if self.is_cuda_runtime_error(e):
-                logging.warning("話者分離モデルのCUDA移行に失敗したためCPUへフォールバックします。", exc_info=True)
-                self.move_diarization_pipeline_to_cpu()
-                self.clear_torch_cache()
-                self.notify_cuda_fallback("話者解析")
-                return "cpu"
-            raise
-
-    def move_diarization_pipeline_to_cpu(self):
-        if self.diarization_pipeline is None or not hasattr(self.diarization_pipeline, "to"):
-            return
-        try:
-            self.diarization_pipeline.to(torch.device("cpu"))
-        except Exception as e:
-            logging.warning(f"話者分離モデルのCPU移行に失敗しました: {e}")
-
-    def run_diarization_pipeline_with_fallback(self, filepath, num_speakers, hook):
-        try:
-            return self.diarization_pipeline(filepath, num_speakers=num_speakers, hook=hook)
-        except Exception as e:
-            if self.is_cuda_runtime_error(e):
-                logging.warning("話者解析のCUDA実行に失敗したためCPUで再試行します。", exc_info=True)
-                self.move_diarization_pipeline_to_cpu()
-                self.clear_torch_cache()
-                self.notify_cuda_fallback("話者解析")
-                return self.diarization_pipeline(filepath, num_speakers=num_speakers, hook=hook)
-            raise
-
-    def transcribe_with_whisper(self, filepath, model_path, initial_prompt, whisper_options):
-        if WhisperModel is None:
-            raise RuntimeError(
-                "Windowsで文字起こしするには faster-whisper が必要です。\n"
-                "requirements-windows.txt を使って依存関係をインストールしてください。"
-            )
-
-        device = self.get_windows_whisper_device()
-        allow_batched = True
-        if self.windows_whisper_device == "cuda" and device == "cpu":
-            allow_batched = False
-            self.notify_cuda_fallback("文字起こし")
-
-        try:
-            return self.transcribe_with_whisper_on_device(
-                filepath,
-                model_path,
-                initial_prompt,
-                whisper_options,
-                device,
-                allow_batched,
-            )
-        except Exception as e:
-            if device == "cuda" and self.is_cuda_runtime_error(e):
-                logging.warning("WhisperのCUDA実行に失敗したためCPUへフォールバックします。", exc_info=True)
-                self.whisper_model_cache.clear()
-                self.clear_torch_cache()
-                self.notify_cuda_fallback("文字起こし")
-                return self.transcribe_with_whisper_on_device(
-                    filepath,
-                    model_path,
-                    initial_prompt,
-                    whisper_options,
-                    "cpu",
-                    False,
-                )
-            raise
-
-    def transcribe_with_whisper_on_device(self, filepath, model_path, initial_prompt, whisper_options, device, allow_batched=True):
-        compute_type = self.get_windows_whisper_compute_type(device)
-        model = self.get_cached_whisper_model(model_path, device, compute_type)
-
-        faster_whisper_options = dict(whisper_options)
-        if "logprob_threshold" in faster_whisper_options:
-            faster_whisper_options["log_prob_threshold"] = faster_whisper_options.pop("logprob_threshold")
-        faster_whisper_options["beam_size"] = self.windows_whisper_beam_size
-        faster_whisper_options["best_of"] = self.windows_whisper_best_of
-        faster_whisper_options.setdefault("vad_filter", self.windows_whisper_vad_filter)
-
-        # BatchedInferencePipelineはVAD前提のため、VAD無効時は通常のtranscribeへ回す
-        use_batched = (
-            self.windows_whisper_use_batched
-            and self.windows_whisper_batch_size > 1
-            and BatchedInferencePipeline is not None
-            and faster_whisper_options.get("vad_filter", False)
-        )
-
-        if use_batched:
-            batched_model = BatchedInferencePipeline(model=model)
-            segments, info = batched_model.transcribe(
-                filepath,
-                batch_size=self.windows_whisper_batch_size,
-                initial_prompt=initial_prompt or None,
-                **faster_whisper_options,
-            )
-        else:
-            segments, info = model.transcribe(
-                filepath,
-                initial_prompt=initial_prompt or None,
-                # VAD無効時でも音声全体を処理対象にする
-                clip_timestamps="0",
-                **faster_whisper_options,
-            )
-        segment_dicts = [
-            {"start": segment.start, "end": segment.end, "text": segment.text}
-            for segment in segments
-        ]
-        text = "".join(segment["text"] for segment in segment_dicts).strip()
-
-        if not text:
-            # しきい値が厳しすぎて空になるケースに備え、通常モードで1回だけ救済する
-            logging.warning("Whisper returned empty text. Retrying with relaxed non-batched options.")
-            retry_options = dict(faster_whisper_options)
-            retry_options.update({
-                "vad_filter": False,
-                "condition_on_previous_text": True,
-                "compression_ratio_threshold": None,
-                "no_speech_threshold": None,
-                "log_prob_threshold": None,
-            })
-            retry_segments, retry_info = model.transcribe(
-                filepath,
-                initial_prompt=initial_prompt or None,
-                clip_timestamps="0",
-                **retry_options,
-            )
-            retry_segment_dicts = [
-                {"start": segment.start, "end": segment.end, "text": segment.text}
-                for segment in retry_segments
-            ]
-            retry_text = "".join(segment["text"] for segment in retry_segment_dicts).strip()
-            if retry_text:
-                segment_dicts = retry_segment_dicts
-                text = retry_text
-                info = retry_info
-
-        return {
-            "text": text,
-            "segments": segment_dicts,
-            "language": getattr(info, "language", None),
-        }
 
     def get_summary_backend_name(self):
         # 設定ファイルの値が古い/不正な場合はLM Studioへ戻す
@@ -823,17 +433,6 @@ class Whisperapp:
             # 要約バックエンドとOllamaモデル名も次回起動時に復元する
             "summary_backend": self.get_summary_backend_name(),
             "ollama_model": self.ollama_model_var.get().strip() or self.default_ollama_model,
-            "config_platform": "Windows",
-            "config_file": self.config_filepath,
-            "windows_whisper_device": self.windows_whisper_device,
-            "windows_whisper_compute_type": self.windows_whisper_compute_type,
-            "windows_whisper_cpu_threads": self.windows_whisper_cpu_threads,
-            "windows_whisper_num_workers": self.windows_whisper_num_workers,
-            "windows_whisper_beam_size": self.windows_whisper_beam_size,
-            "windows_whisper_best_of": self.windows_whisper_best_of,
-            "windows_whisper_batch_size": self.windows_whisper_batch_size,
-            "windows_whisper_use_batched": self.windows_whisper_use_batched,
-            "windows_whisper_vad_filter": self.windows_whisper_vad_filter,
             # 処理性能に関わる値は、画面項目ではなくwhisper_config.jsonから調整する
             "batch_size": self.diarization_batch_size,
             "context_length": self.context_length,
@@ -866,8 +465,234 @@ class Whisperapp:
         except ImportError as e:
             raise RuntimeError(
                 "話者分離を使うには pyannote-audio が必要です。"
-                "requirements-windows.txt を使って依存関係をインストールしてください。"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
             ) from e
+
+    def load_mlx_whisper(self):
+        # MLXはimport時にMetalデバイスへ触れるため、文字起こし開始時まで遅延ロードする
+        if self.mlx_whisper_module is not None:
+            return self.mlx_whisper_module
+
+        try:
+            self.mlx_whisper_module = importlib.import_module("mlx_whisper")
+            return self.mlx_whisper_module
+        except ImportError as e:
+            raise RuntimeError(
+                "macOSで文字起こしするには mlx-whisper が必要です。\n"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
+            ) from e
+        except RuntimeError as e:
+            error_text = str(e).lower()
+            if "metal" in error_text or "load_device" in error_text or "gpu" in error_text:
+                raise RuntimeError(
+                    "MLX/Metalデバイスを利用できないため、文字起こしを開始できません。\n"
+                    "Apple Silicon Macの通常ログイン環境で実行してください。"
+                ) from e
+            raise
+
+    def clear_torch_cache(self):
+        try:
+            if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception as e:
+            logging.warning(f"MPSキャッシュの解放に失敗しました: {e}")
+
+        try:
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            logging.warning(f"CUDAキャッシュの解放に失敗しました: {e}")
+
+    def cleanup_resources(self):
+        gc.collect()
+        self.clear_torch_cache()
+
+    def set_current_subprocess(self, process):
+        with self.process_lock:
+            self.current_subprocess = process
+
+    def clear_current_subprocess(self, process):
+        with self.process_lock:
+            if self.current_subprocess is process:
+                self.current_subprocess = None
+
+    def set_current_worker_process(self, process):
+        with self.process_lock:
+            self.current_worker_process = process
+
+    def clear_current_worker_process(self, process):
+        with self.process_lock:
+            if self.current_worker_process is process:
+                self.current_worker_process = None
+
+    def terminate_subprocess(self, process):
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+        except Exception as e:
+            logging.warning(f"実行中プロセスの停止に失敗しました: {e}")
+
+    def terminate_worker_process(self, process):
+        if process is None:
+            return
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join(timeout=3)
+        except Exception as e:
+            logging.warning(f"文字起こしワーカープロセスの停止に失敗しました: {e}")
+
+    def terminate_active_processes(self):
+        with self.process_lock:
+            current_subprocess = self.current_subprocess
+            current_worker_process = self.current_worker_process
+        self.terminate_subprocess(current_subprocess)
+        self.terminate_worker_process(current_worker_process)
+
+    def run_cancellable_subprocess(self, command, input_text=None, timeout=None):
+        self.ensure_not_cancelled()
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.set_current_subprocess(process)
+        start_time = time.monotonic()
+        communicate_input = input_text
+
+        try:
+            while True:
+                self.ensure_not_cancelled()
+                if timeout is not None and time.monotonic() - start_time > timeout:
+                    self.terminate_subprocess(process)
+                    raise subprocess.TimeoutExpired(command, timeout)
+
+                try:
+                    stdout, stderr = process.communicate(input=communicate_input, timeout=0.2)
+                    self.ensure_not_cancelled()
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    communicate_input = None
+        except CancelledError:
+            self.terminate_subprocess(process)
+            raise
+        finally:
+            self.clear_current_subprocess(process)
+
+    def run_mlx_whisper_transcribe(self, filepath, model_path, initial_prompt, whisper_options):
+        result_file = tempfile.NamedTemporaryFile(
+            prefix="meetingtool_whisper_",
+            suffix=".json",
+            delete=False,
+        )
+        result_path = result_file.name
+        result_file.close()
+
+        ctx = multiprocessing.get_context("spawn")
+        process = ctx.Process(
+            target=mlx_whisper_transcribe_worker,
+            args=(result_path, filepath, model_path, initial_prompt, whisper_options),
+        )
+        process.daemon = True
+        self.set_current_worker_process(process)
+
+        try:
+            process.start()
+            while process.is_alive():
+                if self.cancel_event.is_set():
+                    self.terminate_worker_process(process)
+                    raise CancelledError()
+                process.join(timeout=0.2)
+
+            self.ensure_not_cancelled()
+            if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
+                raise RuntimeError(
+                    f"Whisperワーカープロセスが結果を返さずに終了しました。終了コード: {process.exitcode}"
+                )
+
+            with open(result_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            if not payload.get("ok"):
+                raise RuntimeError(payload.get("error") or "Whisperワーカープロセスでエラーが発生しました。")
+
+            return payload["result"]
+        finally:
+            self.clear_current_worker_process(process)
+            if process.is_alive():
+                self.terminate_worker_process(process)
+            self.remove_temp_file(result_path)
+
+    def prepare_audio_for_diarization(self, filepath):
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "話者分離用の音声変換に ffmpeg が必要です。\n"
+                "`brew install ffmpeg` でインストールし、PATHから実行できる状態にしてください。"
+            )
+
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="meetingtool_diarization_",
+            suffix=".wav",
+            delete=False,
+        )
+        temp_path = temp_file.name
+        temp_file.close()
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            filepath,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-af",
+            "aresample=async=1:first_pts=0,apad=whole_dur=10,apad=pad_dur=1",
+            temp_path,
+        ]
+
+        try:
+            result = self.run_cancellable_subprocess(
+                command,
+            )
+        except OSError as e:
+            self.remove_temp_file(temp_path)
+            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{e}") from e
+
+        if result.returncode != 0:
+            self.remove_temp_file(temp_path)
+            error_detail = result.stderr.strip() or result.stdout.strip() or "ffmpegの実行に失敗しました。"
+            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{error_detail}")
+
+        return temp_path
+
+    def remove_temp_file(self, filepath):
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            logging.warning(f"一時ファイルの削除に失敗しました: {filepath} ({e})")
 
     def save_hf_token(self, show_warnings=True):
         token = self.token_entry.get().strip()
@@ -876,7 +701,7 @@ class Whisperapp:
                 messagebox.showwarning(
                     "トークンを保存できません",
                     "keyring パッケージが見つからないため、Hugging Faceトークンは安全に保存されません。\n"
-                    "requirements-windows.txt を使って依存関係をインストールしてください。"
+                    "requirements-mac.txt を使って依存関係をインストールしてください。"
                 )
             return False
 
@@ -897,15 +722,10 @@ class Whisperapp:
     #コンフィグの読み込み
     def read_config_file(self):
         # 設定ファイルが壊れていてもアプリ起動を止めず、デフォルト値で続行する
-        read_path = self.config_filepath
-        if not os.path.exists(read_path):
-            # OS別設定がまだ無い初回だけ、従来の共通設定を読み込む
-            if os.path.exists(self.legacy_config_filepath):
-                read_path = self.legacy_config_filepath
-            else:
-                return {}
+        if not os.path.exists(self.config_filepath):
+            return {}
         try:
-            with open(read_path, "r", encoding="utf-8") as f:
+            with open(self.config_filepath, "r", encoding="utf-8") as f:
                 config = json.load(f)
             return config if isinstance(config, dict) else {}
         except Exception:
@@ -931,28 +751,6 @@ class Whisperapp:
             return value
         return default
 
-    def get_bool_config(self, config, keys, default):
-        for key in keys:
-            if key not in config:
-                continue
-            raw_value = config.get(key)
-            if isinstance(raw_value, bool):
-                return raw_value
-            if isinstance(raw_value, str):
-                return raw_value.lower() in ("1", "true", "yes", "on")
-            if isinstance(raw_value, int):
-                return raw_value != 0
-        return default
-
-    def get_choice_config(self, config, keys, default, choices):
-        for key in keys:
-            if key not in config:
-                continue
-            value = str(config.get(key, "")).strip()
-            if value in choices:
-                return value
-        return default
-
     def load_runtime_config(self, config=None):
         # バッチサイズやコンテキスト長など、処理開始直前にも反映したい設定だけを読み込む
         config = config if config is not None else self.read_config_file()
@@ -963,7 +761,7 @@ class Whisperapp:
             ("batch_size", "diarization_batch_size"),
             self.diarization_batch_size,
             min_value=1,
-            max_value=4096,
+            max_value=64,
         )
 
         # context_length: 要約時にLM Studioへ渡す1チャンクあたりの目安文字数
@@ -972,69 +770,11 @@ class Whisperapp:
             ("context_length", "summary_context_length", "summary_chunk_chars"),
             self.context_length,
             min_value=1000,
-            max_value=200000,
+            max_value=4000,
         )
         self.summary_chunk_chars = self.context_length
         # 統合要約では入力に余白を残すため、通常チャンクより少し小さめにする
         self.summary_merge_chunk_chars = max(1000, int(self.context_length * 0.75))
-
-        self.windows_whisper_device = self.get_choice_config(
-            config,
-            ("windows_whisper_device", "whisper_device"),
-            self.windows_whisper_device,
-            ("cuda", "cpu"),
-        )
-        self.windows_whisper_compute_type = self.get_choice_config(
-            config,
-            ("windows_whisper_compute_type", "whisper_compute_type"),
-            self.windows_whisper_compute_type,
-            ("float16", "int8_float16", "int8"),
-        )
-        self.windows_whisper_cpu_threads = self.get_int_config(
-            config,
-            ("windows_whisper_cpu_threads", "whisper_cpu_threads"),
-            self.windows_whisper_cpu_threads,
-            min_value=1,
-            max_value=32,
-        )
-        self.windows_whisper_num_workers = self.get_int_config(
-            config,
-            ("windows_whisper_num_workers", "whisper_num_workers"),
-            self.windows_whisper_num_workers,
-            min_value=1,
-            max_value=4,
-        )
-        self.windows_whisper_beam_size = self.get_int_config(
-            config,
-            ("windows_whisper_beam_size", "whisper_beam_size"),
-            self.windows_whisper_beam_size,
-            min_value=1,
-            max_value=10,
-        )
-        self.windows_whisper_best_of = self.get_int_config(
-            config,
-            ("windows_whisper_best_of", "whisper_best_of"),
-            self.windows_whisper_best_of,
-            min_value=1,
-            max_value=10,
-        )
-        self.windows_whisper_batch_size = self.get_int_config(
-            config,
-            ("windows_whisper_batch_size", "whisper_batch_size"),
-            self.windows_whisper_batch_size,
-            min_value=1,
-            max_value=32,
-        )
-        self.windows_whisper_use_batched = self.get_bool_config(
-            config,
-            ("windows_whisper_use_batched", "whisper_use_batched"),
-            self.windows_whisper_use_batched,
-        )
-        self.windows_whisper_vad_filter = self.get_bool_config(
-            config,
-            ("windows_whisper_vad_filter", "whisper_vad_filter"),
-            self.windows_whisper_vad_filter,
-        )
 
     def load_config(self):
         config = self.read_config_file()
@@ -1330,6 +1070,17 @@ class Whisperapp:
         )
 
     def start_ollama_server(self):
+        # macOSではOllama.appをバックグラウンド起動するのが自然
+        if platform.system() == "Darwin" and shutil.which("open") is not None:
+            subprocess.Popen(
+                ["open", "-gja", "Ollama"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+            )
+            return
+
+        # macOS以外ではCLIサーバーを直接起動する
         creationflags = 0
         if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
             creationflags = subprocess.CREATE_NO_WINDOW
@@ -1882,219 +1633,6 @@ class Whisperapp:
             self.terminate_active_processes()
 
     #実行処理フェーズ
-    def cleanup_resources(self):
-        gc.collect()
-        self.clear_torch_cache()
-
-    def set_current_subprocess(self, process):
-        with self.process_lock:
-            self.current_subprocess = process
-
-    def clear_current_subprocess(self, process):
-        with self.process_lock:
-            if self.current_subprocess is process:
-                self.current_subprocess = None
-
-    def set_current_worker_process(self, process):
-        with self.process_lock:
-            self.current_worker_process = process
-
-    def clear_current_worker_process(self, process):
-        with self.process_lock:
-            if self.current_worker_process is process:
-                self.current_worker_process = None
-
-    def terminate_subprocess(self, process):
-        if process is None:
-            return
-        try:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait(timeout=3)
-        except Exception as e:
-            logging.warning(f"実行中プロセスの停止に失敗しました: {e}")
-
-    def terminate_worker_process(self, process):
-        if process is None:
-            return
-        try:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=3)
-                if process.is_alive() and hasattr(process, "kill"):
-                    process.kill()
-                    process.join(timeout=3)
-        except Exception as e:
-            logging.warning(f"文字起こしワーカープロセスの停止に失敗しました: {e}")
-
-    def terminate_active_processes(self):
-        with self.process_lock:
-            current_subprocess = self.current_subprocess
-            current_worker_process = self.current_worker_process
-        self.terminate_subprocess(current_subprocess)
-        self.terminate_worker_process(current_worker_process)
-
-    def run_cancellable_subprocess(self, command, input_text=None, timeout=None):
-        self.ensure_not_cancelled()
-        creationflags = 0
-        if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW"):
-            creationflags = subprocess.CREATE_NO_WINDOW
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE if input_text is not None else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=creationflags,
-        )
-        self.set_current_subprocess(process)
-        start_time = time.monotonic()
-        communicate_input = input_text
-
-        try:
-            while True:
-                self.ensure_not_cancelled()
-                if timeout is not None and time.monotonic() - start_time > timeout:
-                    self.terminate_subprocess(process)
-                    raise subprocess.TimeoutExpired(command, timeout)
-
-                try:
-                    stdout, stderr = process.communicate(input=communicate_input, timeout=0.2)
-                    self.ensure_not_cancelled()
-                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
-                except subprocess.TimeoutExpired:
-                    communicate_input = None
-        except CancelledError:
-            self.terminate_subprocess(process)
-            raise
-        finally:
-            self.clear_current_subprocess(process)
-
-    def get_whisper_worker_config(self):
-        device = self.get_windows_whisper_device()
-        if self.windows_whisper_device == "cuda" and device == "cpu":
-            self.notify_cuda_fallback("文字起こし")
-        return {
-            "device": device,
-            "compute_type": self.windows_whisper_compute_type,
-            "cpu_threads": self.windows_whisper_cpu_threads,
-            "num_workers": self.windows_whisper_num_workers,
-            "beam_size": self.windows_whisper_beam_size,
-            "best_of": self.windows_whisper_best_of,
-            "batch_size": self.windows_whisper_batch_size,
-            "use_batched": self.windows_whisper_use_batched,
-        }
-
-    def run_faster_whisper_transcribe(self, filepath, model_path, initial_prompt, whisper_options):
-        result_file = tempfile.NamedTemporaryFile(
-            prefix="meetingtool_whisper_",
-            suffix=".json",
-            delete=False,
-        )
-        result_path = result_file.name
-        result_file.close()
-
-        worker_config = self.get_whisper_worker_config()
-        ctx = multiprocessing.get_context("spawn")
-        process = ctx.Process(
-            target=faster_whisper_transcribe_worker,
-            args=(result_path, filepath, model_path, initial_prompt, whisper_options, worker_config),
-        )
-        process.daemon = True
-        self.set_current_worker_process(process)
-
-        try:
-            process.start()
-            while process.is_alive():
-                if self.cancel_event.is_set():
-                    self.terminate_worker_process(process)
-                    raise CancelledError()
-                process.join(timeout=0.2)
-
-            self.ensure_not_cancelled()
-            if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
-                raise RuntimeError(
-                    f"Whisperワーカープロセスが結果を返さずに終了しました。終了コード: {process.exitcode}"
-                )
-
-            with open(result_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-
-            if not payload.get("ok"):
-                raise RuntimeError(payload.get("error") or "Whisperワーカープロセスでエラーが発生しました。")
-            if payload.get("fallback_to_cpu") and self.windows_whisper_device == "cuda":
-                self.notify_cuda_fallback("文字起こし")
-
-            return payload["result"]
-        finally:
-            self.clear_current_worker_process(process)
-            if process.is_alive():
-                self.terminate_worker_process(process)
-            self.remove_temp_file(result_path)
-
-    def prepare_audio_for_diarization(self, filepath):
-        if shutil.which("ffmpeg") is None:
-            raise RuntimeError(
-                "話者分離用の音声変換に ffmpeg が必要です。\n"
-                "ffmpegをインストールし、PATHから実行できる状態にしてください。"
-            )
-
-        temp_file = tempfile.NamedTemporaryFile(
-            prefix="meetingtool_diarization_",
-            suffix=".wav",
-            delete=False,
-        )
-        temp_path = temp_file.name
-        temp_file.close()
-
-        command = [
-            "ffmpeg",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            filepath,
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            "-af",
-            "aresample=async=1:first_pts=0,apad=whole_dur=10,apad=pad_dur=1",
-            temp_path,
-        ]
-
-        try:
-            result = self.run_cancellable_subprocess(
-                command,
-            )
-        except OSError as e:
-            self.remove_temp_file(temp_path)
-            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{e}") from e
-
-        if result.returncode != 0:
-            self.remove_temp_file(temp_path)
-            error_detail = result.stderr.strip() or result.stdout.strip() or "ffmpegの実行に失敗しました。"
-            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{error_detail}")
-
-        return temp_path
-
-    def remove_temp_file(self, filepath):
-        try:
-            if filepath and os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception as e:
-            logging.warning(f"一時ファイルの削除に失敗しました: {filepath} ({e})")
-
     def run_process(self, task_config):
         temp_diarization_path = None
         try:
@@ -2118,7 +1656,7 @@ class Whisperapp:
             self.safe_after(lambda: self.progress.start())
             model_path = self.models[task_config["model_label"]]
 
-            #長時間データの場合の安定化オプション
+            #長時間データの場合の安定化オプション（M2チップ16GB向けにメモリ節約設定）
             whisper_options = {
                 "language": "ja",                       #言語を日本語に固定
                 "condition_on_previous_text": False,   #前の文脈を引きずらない
@@ -2127,13 +1665,13 @@ class Whisperapp:
                 "logprob_threshold": -0.8,              #無音区間の暴走抑止
                 "temperature": 0.0,                      #ランダムな記号の生成抑止
                 "word_timestamps": False,               #タイムスタンプ計算のバグによる記号生成の抑止
-                "best_of": 3                            #3つの候補から最も適切なものを選択
+                "best_of": 1                            #メモリ節約のため候補数を1に設定
             }
-            # Windows専用版ではfaster-whisperで文字起こし
-            whisper_result = self.run_faster_whisper_transcribe(
+            # Whisperで文字起こし
+            whisper_result = self.run_mlx_whisper_transcribe(
                 filepath,
                 model_path,
-                initial_prompt_str,
+                initial_prompt_str or None,
                 whisper_options,
             )
             
@@ -2153,7 +1691,8 @@ class Whisperapp:
 
             final_text = ""
             gc.collect() 
-            self.clear_torch_cache()
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()  # M2チップ向けにメモリクリアを強化
 
             # 2.話者分離の実行
             if do_diarize:
@@ -2169,7 +1708,8 @@ class Whisperapp:
                         Pipeline = self.load_diarization_pipeline_class()
                         self.diarization_pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1", token=auth_param)
 
-                        self.move_diarization_pipeline_to_best_device()
+                        if torch.backends.mps.is_available() and hasattr(self.diarization_pipeline, "to"):
+                            self.diarization_pipeline.to(torch.device("mps"))
                     except Exception as e:
                         raise RuntimeError(f"話者分離モデルの読み込みに失敗しました:\n{e}")
                 if hasattr(self.diarization_pipeline, "set_batch_size"):
@@ -2192,7 +1732,7 @@ class Whisperapp:
                             text=f"話者解析中...しばらくお待ちください... ({percentage_int}%)"))
 
                 num_spk = None if task_config["num_speakers"] == "自動" else int(task_config["num_speakers"])
-                diarization_result = self.run_diarization_pipeline_with_fallback(diarization_filepath, num_spk, diarization_hook)
+                diarization_result = self.diarization_pipeline(diarization_filepath, num_speakers=num_spk, hook=diarization_hook)
 
                 self.ensure_not_cancelled()
                 
@@ -2237,14 +1777,6 @@ class Whisperapp:
                 final_text = whisper_result["text"].strip()
 
             final_text = self.clean_repeated_text(final_text)
-            if not final_text.strip():
-                # 空の結果を成功扱いすると原因が見えないため、明示的にエラーとして止める
-                raise RuntimeError(
-                    "文字起こし結果が空でした。\n"
-                    "音声が小さい、無音として判定された、または音声形式を読み取れなかった可能性があります。\n"
-                    "Windows版ではVADを既定で無効にしました。もう一度実行してください。"
-                )
-
             auto_mask_counts = None
             if task_config["privacy_mask_auto"]:
                 final_text, auto_mask_counts = self.mask_privacy_text(
@@ -2252,20 +1784,20 @@ class Whisperapp:
                     task_config["privacy_mask_terms"],
                 )
 
+            gc.collect()  # メモリクリアを追加
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
             self.ensure_not_cancelled() #最終結果表示前にキャンセルされていないか確認
             self.safe_after(lambda: self.show_result(final_text, auto_mask_counts))
 
         except CancelledError:
-            self.cleanup_resources() #メモリ解放
             gc.collect()
-            self.clear_torch_cache()
+            if torch.backends.mps.is_available(): torch.mps.empty_cache()
             self.safe_after(lambda: self.reset_ui_after_task("処理が中止されました"))
 
         #エラー表示
         except Exception as e:
-            self.cleanup_resources() #メモリ解放
-            # 画面には短いエラー、app.logには追跡用のスタックトレースを残す
-            logging.exception("Transcription task failed")
             error_msg = f"処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("エラーが発生しました"))
@@ -2352,7 +1884,7 @@ class Whisperapp:
         summary_backend = self.get_summary_backend_name()
         ollama_model = self.ollama_model_var.get().strip() or self.default_ollama_model
         # 選択されたバックエンドをワーカースレッドへ渡して要約処理内で分岐する
-        self.status_label.configure(text=f"{summary_backend}の起動確認中...") 
+        self.status_label.configure(text=f"{summary_backend}の起動確認中...")
         self.progress.configure(mode="determinate")
         self.progress.set(0)
 
@@ -2367,7 +1899,7 @@ class Whisperapp:
         self.processing_thread.daemon = True
         self.processing_thread.start()  
 
-    #LM Studioと連携した要約処理の実行
+    #LM Studio / Ollama CLIと連携した要約処理の実行
     def run_summarize_process(self, text, system_prompt, summary_mode, summary_backend, ollama_model):
         try:
             self.ensure_not_cancelled()
@@ -2624,17 +2156,14 @@ class Whisperapp:
             self.safe_after(lambda: self.show_summary_result(summary_result))
 
         except CancelledError:
-            self.cleanup_resources()
             self.safe_after(lambda: self.reset_ui_after_task("要約処理が中止されました"))
 
         except LMStudioConnectionError as e:
-            self.cleanup_resources()
             error_msg = str(e)
             self.safe_after(lambda: messagebox.showerror("LM Studio未起動", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("LM Studioを確認してください"))
 
         except OllamaConnectionError as e:
-            self.cleanup_resources()
             error_msg = str(e)
             self.safe_after(lambda: messagebox.showerror("Ollama CLIエラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("Ollama CLIを確認してください"))
@@ -2646,16 +2175,14 @@ class Whisperapp:
             )
             self.safe_after(lambda: messagebox.showerror("タイムアウト", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約がタイムアウトしました"))
-            self.cleanup_resources()
 
         except TimeoutError as e:
             error_msg = str(e)
             self.safe_after(lambda: messagebox.showerror("タイムアウト", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約がタイムアウトしました"))
-            self.cleanup_resources()
+
 
         except Exception as e:
-            self.cleanup_resources()
             error_msg = f"要約処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("要約に失敗しました"))

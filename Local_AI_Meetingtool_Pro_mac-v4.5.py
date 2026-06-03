@@ -1,10 +1,9 @@
-#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio使用）
-#使用時はLM Studioでローカルサーバーを起動し、llamaを使用すること
+#文字おこし、話者分離、要約に対応したバージョン（要約はLM Studio / Ollama CLI使用）
+#使用時はLM Studioでローカルサーバーを起動するか、Ollama CLIでモデルを用意すること
 #Windowsでは動作しないので注意
 #M5 Pro 48GBに合わせた設定
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
-import mlx_whisper
+from tkinter import TclError, filedialog, messagebox
 import threading
 import os
 import logging
@@ -15,10 +14,12 @@ import gc
 import torch
 import openai
 import importlib
+import multiprocessing
 # Ollama CLI連携とmacOS/Windows別の起動処理で使用
 import platform
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import datetime #自動保存用のタイムスタンプ取得
 
@@ -33,6 +34,54 @@ class LMStudioConnectionError(Exception):
 class OllamaConnectionError(Exception):
     pass
 
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+    return str(value)
+
+def mlx_whisper_transcribe_worker(result_path, filepath, model_path, initial_prompt, whisper_options):
+    try:
+        mlx_whisper = importlib.import_module("mlx_whisper")
+        whisper_result = mlx_whisper.transcribe(
+            filepath,
+            path_or_hf_repo=model_path,
+            initial_prompt=initial_prompt,
+            **whisper_options,
+        )
+        payload = {"ok": True, "result": make_json_safe(whisper_result)}
+    except ImportError as e:
+        payload = {
+            "ok": False,
+            "error": (
+                "macOSで文字起こしするには mlx-whisper が必要です。\n"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
+            ),
+        }
+    except RuntimeError as e:
+        error_text = str(e).lower()
+        if "metal" in error_text or "load_device" in error_text or "gpu" in error_text:
+            error_message = (
+                "MLX/Metalデバイスを利用できないため、文字起こしを開始できません。\n"
+                "Apple Silicon Macの通常ログイン環境で実行してください。"
+            )
+        else:
+            error_message = str(e)
+        payload = {"ok": False, "error": error_message}
+    except BaseException as e:
+        payload = {"ok": False, "error": f"{e.__class__.__name__}: {e}"}
+
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
 # --- 環境設定 ---
 os.environ["HF_HUB_OFFLINE"] = "0"
 # pyannoteは重いため、話者分離を使う場合だけ遅延ロードする
@@ -44,13 +93,33 @@ ctk.set_default_color_theme("blue")
 class Whisperapp:
     SUMMARY_HEADER = "=========================\n【要約結果】\n========================="
     SUMMARY_SECTION_PATTERN = re.compile(r"\n\s*\n=+\n【要約結果】\n=+\n.*\Z", re.DOTALL)
+    SUMMARY_ONLY_INSTRUCTION = (
+        "思考過程、推論、検討メモ、内部メモ、<think>タグは出力しないでください。"
+        "最終的な要約本文だけを出力してください。"
+    )
+    REASONING_TAG_PATTERN = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+    STRAY_REASONING_TAG_PATTERN = re.compile(r"</?think\b[^>]*>", re.IGNORECASE)
+    REASONING_LABEL_WITH_SUMMARY_PATTERN = re.compile(
+        r"^\s*(?:思考プロセス|思考過程|推論|Reasoning|Thought process|Analysis)\s*[:：].*?"
+        r"(?=\n\s*(?:要約結果|要約|Summary|Final answer|回答)\s*[:：])",
+        re.IGNORECASE | re.DOTALL,
+    )
+    REASONING_LABEL_PARAGRAPH_PATTERN = re.compile(
+        r"^\s*(?:思考プロセス|思考過程|推論|Reasoning|Thought process|Analysis)\s*[:：].*?(?:\n\s*\n|\Z)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    SUMMARY_LABEL_PATTERN = re.compile(
+        r"^\s*(?:要約結果|要約|Summary|Final answer|回答)\s*[:：]\s*",
+        re.IGNORECASE,
+    )
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Local AI MeetingTool Pro Ver.4 - 文字起こし & 要約")
-        self.root.geometry("1000x800")
+        self.root.title("Local AI MeetingTool Pro Ver.4.5 - 文字起こし & 要約")
+        self.root.geometry("1200x1000")
         self.root.configure(fg_color="#FFFFFF")
         self.is_closing = False
+        self.after_ids = set()
 
         # Mac用フォント設定
         self.font_title = ("Hiragino Sans", 15, "bold")
@@ -61,6 +130,10 @@ class Whisperapp:
         self.processing_thread = None
         self.cancel_event = threading.Event()
         self.active_task = None
+        self.current_subprocess = None
+        self.current_worker_process = None
+        self.process_lock = threading.Lock()
+        self.mlx_whisper_module = None
         self.keyring = self.load_keyring()
         self.keyring_service = "Local AI MeetingTool Pro Ver.4"
         self.keyring_username = "huggingface_token"
@@ -344,8 +417,8 @@ class Whisperapp:
         self.summarize_btn.configure(text=f"{backend}で要約")
 
     #コンフィグの保存
-    def save_config(self):
-        self.save_hf_token()
+    def save_config(self, show_warnings=True):
+        self.save_hf_token(show_warnings=show_warnings)
         config = self.read_config_file()
         # 古い設定ファイルに残っている可能性があるトークンは、再保存時にJSONから除外する
         config.pop("hf_token", None)
@@ -397,17 +470,243 @@ class Whisperapp:
         except ImportError as e:
             raise RuntimeError(
                 "話者分離を使うには pyannote-audio が必要です。"
-                "requirements.txt を使って依存関係をインストールしてください。"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
             ) from e
 
-    def save_hf_token(self):
+    def load_mlx_whisper(self):
+        # MLXはimport時にMetalデバイスへ触れるため、文字起こし開始時まで遅延ロードする
+        if self.mlx_whisper_module is not None:
+            return self.mlx_whisper_module
+
+        try:
+            self.mlx_whisper_module = importlib.import_module("mlx_whisper")
+            return self.mlx_whisper_module
+        except ImportError as e:
+            raise RuntimeError(
+                "macOSで文字起こしするには mlx-whisper が必要です。\n"
+                "requirements-mac.txt を使って依存関係をインストールしてください。"
+            ) from e
+        except RuntimeError as e:
+            error_text = str(e).lower()
+            if "metal" in error_text or "load_device" in error_text or "gpu" in error_text:
+                raise RuntimeError(
+                    "MLX/Metalデバイスを利用できないため、文字起こしを開始できません。\n"
+                    "Apple Silicon Macの通常ログイン環境で実行してください。"
+                ) from e
+            raise
+
+    def clear_torch_cache(self):
+        try:
+            if hasattr(torch, "mps") and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception as e:
+            logging.warning(f"MPSキャッシュの解放に失敗しました: {e}")
+
+        try:
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            logging.warning(f"CUDAキャッシュの解放に失敗しました: {e}")
+
+    def cleanup_resources(self):
+        gc.collect()
+        self.clear_torch_cache()
+
+    def set_current_subprocess(self, process):
+        with self.process_lock:
+            self.current_subprocess = process
+
+    def clear_current_subprocess(self, process):
+        with self.process_lock:
+            if self.current_subprocess is process:
+                self.current_subprocess = None
+
+    def set_current_worker_process(self, process):
+        with self.process_lock:
+            self.current_worker_process = process
+
+    def clear_current_worker_process(self, process):
+        with self.process_lock:
+            if self.current_worker_process is process:
+                self.current_worker_process = None
+
+    def terminate_subprocess(self, process):
+        if process is None:
+            return
+        try:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+        except Exception as e:
+            logging.warning(f"実行中プロセスの停止に失敗しました: {e}")
+
+    def terminate_worker_process(self, process):
+        if process is None:
+            return
+        try:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+                if process.is_alive() and hasattr(process, "kill"):
+                    process.kill()
+                    process.join(timeout=3)
+        except Exception as e:
+            logging.warning(f"文字起こしワーカープロセスの停止に失敗しました: {e}")
+
+    def terminate_active_processes(self):
+        with self.process_lock:
+            current_subprocess = self.current_subprocess
+            current_worker_process = self.current_worker_process
+        self.terminate_subprocess(current_subprocess)
+        self.terminate_worker_process(current_worker_process)
+
+    def run_cancellable_subprocess(self, command, input_text=None, timeout=None):
+        self.ensure_not_cancelled()
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.set_current_subprocess(process)
+        start_time = time.monotonic()
+        communicate_input = input_text
+
+        try:
+            while True:
+                self.ensure_not_cancelled()
+                if timeout is not None and time.monotonic() - start_time > timeout:
+                    self.terminate_subprocess(process)
+                    raise subprocess.TimeoutExpired(command, timeout)
+
+                try:
+                    stdout, stderr = process.communicate(input=communicate_input, timeout=0.2)
+                    self.ensure_not_cancelled()
+                    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    communicate_input = None
+        except CancelledError:
+            self.terminate_subprocess(process)
+            raise
+        finally:
+            self.clear_current_subprocess(process)
+
+    def run_mlx_whisper_transcribe(self, filepath, model_path, initial_prompt, whisper_options):
+        result_file = tempfile.NamedTemporaryFile(
+            prefix="meetingtool_whisper_",
+            suffix=".json",
+            delete=False,
+        )
+        result_path = result_file.name
+        result_file.close()
+
+        ctx = multiprocessing.get_context("spawn")
+        process = ctx.Process(
+            target=mlx_whisper_transcribe_worker,
+            args=(result_path, filepath, model_path, initial_prompt, whisper_options),
+        )
+        process.daemon = True
+        self.set_current_worker_process(process)
+
+        try:
+            process.start()
+            while process.is_alive():
+                if self.cancel_event.is_set():
+                    self.terminate_worker_process(process)
+                    raise CancelledError()
+                process.join(timeout=0.2)
+
+            self.ensure_not_cancelled()
+            if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
+                raise RuntimeError(
+                    f"Whisperワーカープロセスが結果を返さずに終了しました。終了コード: {process.exitcode}"
+                )
+
+            with open(result_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            if not payload.get("ok"):
+                raise RuntimeError(payload.get("error") or "Whisperワーカープロセスでエラーが発生しました。")
+
+            return payload["result"]
+        finally:
+            self.clear_current_worker_process(process)
+            if process.is_alive():
+                self.terminate_worker_process(process)
+            self.remove_temp_file(result_path)
+
+    def prepare_audio_for_diarization(self, filepath):
+        if shutil.which("ffmpeg") is None:
+            raise RuntimeError(
+                "話者分離用の音声変換に ffmpeg が必要です。\n"
+                "`brew install ffmpeg` でインストールし、PATHから実行できる状態にしてください。"
+            )
+
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="meetingtool_diarization_",
+            suffix=".wav",
+            delete=False,
+        )
+        temp_path = temp_file.name
+        temp_file.close()
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            filepath,
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            "-af",
+            "aresample=async=1:first_pts=0,apad=whole_dur=10,apad=pad_dur=1",
+            temp_path,
+        ]
+
+        try:
+            result = self.run_cancellable_subprocess(
+                command,
+            )
+        except OSError as e:
+            self.remove_temp_file(temp_path)
+            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{e}") from e
+
+        if result.returncode != 0:
+            self.remove_temp_file(temp_path)
+            error_detail = result.stderr.strip() or result.stdout.strip() or "ffmpegの実行に失敗しました。"
+            raise RuntimeError(f"話者分離用の音声変換に失敗しました:\n{error_detail}")
+
+        return temp_path
+
+    def remove_temp_file(self, filepath):
+        try:
+            if filepath and os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            logging.warning(f"一時ファイルの削除に失敗しました: {filepath} ({e})")
+
+    def save_hf_token(self, show_warnings=True):
         token = self.token_entry.get().strip()
         if self.keyring is None:
-            if token:
+            if token and show_warnings:
                 messagebox.showwarning(
                     "トークンを保存できません",
                     "keyring パッケージが見つからないため、Hugging Faceトークンは安全に保存されません。\n"
-                    "requirements.txt を使って依存関係をインストールしてください。"
+                    "requirements-mac.txt を使って依存関係をインストールしてください。"
                 )
             return False
 
@@ -421,7 +720,8 @@ class Whisperapp:
                     pass
             return True
         except Exception as e:
-            messagebox.showwarning("トークン保存エラー", f"Hugging Faceトークンを安全に保存できませんでした:\n{e}")
+            if show_warnings:
+                messagebox.showwarning("トークン保存エラー", f"Hugging Faceトークンを安全に保存できませんでした:\n{e}")
             return False
 
     #コンフィグの読み込み
@@ -529,20 +829,68 @@ class Whisperapp:
             if self.save_hf_token():
                 self.save_config()
 
+    # 終了プロセス
     def on_closing(self):
+        if self.is_closing:
+            return
         self.is_closing = True
         self.cancel_event.set()
-        self.save_config()
-        self.root.destroy()
+        self.terminate_active_processes()
+        self.cancel_pending_after_callbacks()
+        self.stop_progress_animation()
+        try:
+            self.save_config(show_warnings=False)
+        except Exception as e:
+            logging.warning(f"終了時の設定保存に失敗しました: {e}")
+        try:
+            self.root.destroy()
+        except TclError as e:
+            logging.debug(f"終了時のウィンドウ破棄をスキップしました: {e}")
+
+    def cancel_pending_after_callbacks(self):
+        for after_id in list(self.after_ids):
+            try:
+                self.root.after_cancel(after_id)
+            except Exception as e:
+                logging.debug(f"終了時のafterキャンセルをスキップしました: {e}")
+        self.after_ids.clear()
+
+    def stop_progress_animation(self):
+        if not hasattr(self, "progress"):
+            return
+        try:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+        except Exception as e:
+            logging.debug(f"終了時のプログレスバー停止をスキップしました: {e}")
 
     def safe_after(self, callback):
         if self.is_closing:
             return
+        after_id = None
+
+        def run_callback():
+            self.after_ids.discard(after_id)
+            if self.is_closing:
+                return
+            try:
+                if not self.root.winfo_exists():
+                    return
+                callback()
+            except TclError as e:
+                if not self.is_closing:
+                    logging.error(f"UI 更新エラー (safe_after): {e}")
+            except Exception as e:
+                logging.error(f"UI 更新エラー (safe_after): {e}")
+
         try:
-            self.root.after(0,callback)
+            after_id = self.root.after(0, run_callback)
+            self.after_ids.add(after_id)
+        except TclError as e:
+            if not self.is_closing:
+                logging.error(f"UI 更新エラー (safe_after): {e}")
         except Exception as e:
             logging.error(f"UI 更新エラー (safe_after): {e}")
-            pass
 
     def has_result_text(self):
         return bool(self.result_area.get("1.0", ctk.END).strip())
@@ -618,6 +966,23 @@ class Whisperapp:
         if header_index == -1:
             return ""
         return summary_section[header_index + len(self.SUMMARY_HEADER):].strip()
+
+    # ollamaで要約する時思考プロセスを要約文に入れない
+    def extract_summary_only(self, text):
+        cleaned = (text or "").strip()
+        if not cleaned:
+            return ""
+
+        previous = None
+        while previous != cleaned:
+            previous = cleaned
+            cleaned = self.REASONING_TAG_PATTERN.sub("", cleaned).strip()
+
+        cleaned = self.STRAY_REASONING_TAG_PATTERN.sub("", cleaned).strip()
+        cleaned = self.REASONING_LABEL_WITH_SUMMARY_PATTERN.sub("", cleaned).strip()
+        cleaned = self.REASONING_LABEL_PARAGRAPH_PATTERN.sub("", cleaned).strip()
+        cleaned = self.SUMMARY_LABEL_PATTERN.sub("", cleaned).strip()
+        return cleaned
 
     # 文字起こしが完了したらテキストファイルを自動保存
     def auto_save_text(self, text):
@@ -710,12 +1075,8 @@ class Whisperapp:
 
     def run_ollama_list(self):
         # Ollamaサーバーの起動確認とローカルモデル一覧の取得
-        return subprocess.run(
+        return self.run_cancellable_subprocess(
             ["ollama", "list"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=self.lm_studio_check_timeout_seconds,
         )
 
@@ -751,10 +1112,12 @@ class Whisperapp:
                 "Ollamaをインストールし、ターミナルで `ollama` が実行できる状態にしてから再実行してください。"
             )
 
+        last_error = ""
         try:
             result = self.run_ollama_list()
-        except subprocess.TimeoutExpired as e:
+        except subprocess.TimeoutExpired:
             result = None
+            last_error = "Ollama CLI の起動確認がタイムアウトしました。"
         except OSError as e:
             raise OllamaConnectionError(
                 f"Ollama CLI の実行に失敗しました:\n{e}"
@@ -770,7 +1133,8 @@ class Whisperapp:
                     f"Ollama の自動起動に失敗しました:\n{e}"
                 ) from e
 
-            last_error = "" if result is None else result.stderr.strip()
+            if result is not None:
+                last_error = result.stderr.strip()
             for _ in range(12):
                 self.ensure_not_cancelled()
                 time.sleep(1)
@@ -804,7 +1168,32 @@ class Whisperapp:
 
         return True
 
-    def build_ollama_prompt(self, messages):
+    # ollamaで処理した時に思考プロセスを要約に反映しない。
+    def with_summary_output_guard(self, messages):
+        guarded_messages = []
+        has_system_message = False
+
+        for message in messages:
+            guarded_message = dict(message)
+            role = guarded_message.get("role", "user")
+            if role == "system":
+                has_system_message = True
+                content = guarded_message.get("content", "").strip()
+                if self.SUMMARY_ONLY_INSTRUCTION not in content:
+                    content = f"{content}\n\n{self.SUMMARY_ONLY_INSTRUCTION}" if content else self.SUMMARY_ONLY_INSTRUCTION
+                guarded_message["content"] = content
+            guarded_messages.append(guarded_message)
+
+        if not has_system_message:
+            guarded_messages.insert(0, {"role": "system", "content": self.SUMMARY_ONLY_INSTRUCTION})
+
+        return guarded_messages
+
+    def should_disable_ollama_thinking(self, ollama_model):
+        model = (ollama_model or "").lower()
+        return "qwen3" in model or "qwq" in model
+
+    def build_ollama_prompt(self, messages, ollama_model=""):
         # OpenAI互換のmessagesをOllama CLIへ渡す単一プロンプトへ変換する
         prompt_parts = []
         for message in messages:
@@ -819,7 +1208,10 @@ class Whisperapp:
             else:
                 prompt_parts.append(f"User:\n{content}")
         prompt_parts.append("Assistant:")
-        return "\n\n".join(prompt_parts)
+        prompt = "\n\n".join(prompt_parts)
+        if self.should_disable_ollama_thinking(ollama_model):
+            prompt = f"/no_think\n\n{prompt}"
+        return prompt
 
     # ユーザー辞書の設定
     def parse_dictionary_text(self, dictionary_text, allow_csv_pairs=False):
@@ -868,7 +1260,7 @@ class Whisperapp:
                 continue
 
             entries = [entry.strip() for entry in re.split(r"[、,，]", line) if entry.strip()]
-            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み児だけ2列を置換ペアにする
+            # 通常入力の「AI、ML」は2つのヒント語として扱い、CSV読み込み時だけ2列を置換ペアにする
             if allow_csv_pairs and len(entries) == 2:
                 add_mapping(entries[0], entries[1], line)
             else:
@@ -938,7 +1330,7 @@ class Whisperapp:
                     continue
 
                 source, target = split_mapping(entry)
-                if source is None:
+                if source is None or target is None:
                     invalid_entries.append(entry)
                     continue
 
@@ -1248,10 +1640,11 @@ class Whisperapp:
             self.status_label.configure(text="中止しています...")
             self.cancel_btn.configure(state="disabled")
             self.cancel_event.set()
-            self.cleanup_resources()
+            self.terminate_active_processes()
 
     #実行処理フェーズ
     def run_process(self, task_config):
+        temp_diarization_path = None
         try:
             filepath = task_config["filepath"]
             token = task_config["token"]
@@ -1282,14 +1675,14 @@ class Whisperapp:
                 "logprob_threshold": -0.8,              #無音区間の暴走抑止
                 "temperature": 0.0,                      #ランダムな記号の生成抑止
                 "word_timestamps": False,               #タイムスタンプ計算のバグによる記号生成の抑止
-                "best_of": 3                            #5つの候補から最も適切なものを選択
+                "best_of": 3                            #3つの候補から最も適切なものを選択
             }
             # Whisperで文字起こし
-            whisper_result = mlx_whisper.transcribe(
+            whisper_result = self.run_mlx_whisper_transcribe(
                 filepath,
-                path_or_hf_repo=model_path,
-                initial_prompt=initial_prompt_str or None,
-                **whisper_options,
+                model_path,
+                initial_prompt_str or None,
+                whisper_options,
             )
             
             # 途中でキャンセルされていないか確認
@@ -1314,6 +1707,10 @@ class Whisperapp:
             # 2.話者分離の実行
             if do_diarize:
                 self.ensure_not_cancelled() # キャンセルされていないか確認
+                self.safe_after(lambda: self.status_label.configure(text="話者解析用の音声を準備中..."))
+                temp_diarization_path = self.prepare_audio_for_diarization(filepath)
+                diarization_filepath = temp_diarization_path
+                self.ensure_not_cancelled()
                 self.safe_after(lambda: self.status_label.configure(text="話者解析中... (初回はモデルをロードします)"))
                 if self.diarization_pipeline is None:
                     auth_param = token if token else None
@@ -1345,7 +1742,7 @@ class Whisperapp:
                             text=f"話者解析中...しばらくお待ちください... ({percentage_int}%)"))
 
                 num_spk = None if task_config["num_speakers"] == "自動" else int(task_config["num_speakers"])
-                diarization_result = self.diarization_pipeline(filepath, num_speakers=num_spk, hook=diarization_hook)
+                diarization_result = self.diarization_pipeline(diarization_filepath, num_speakers=num_spk, hook=diarization_hook)
 
                 self.ensure_not_cancelled()
                 
@@ -1412,6 +1809,9 @@ class Whisperapp:
             error_msg = f"処理中にエラーが発生しました:\n{str(e)}"
             self.safe_after(lambda: messagebox.showerror("エラー", error_msg))
             self.safe_after(lambda: self.reset_ui_after_task("エラーが発生しました"))
+
+        finally:
+            self.remove_temp_file(temp_diarization_path)
 
     #結果表示
     def show_result(self, text, auto_mask_counts=None):
@@ -1529,17 +1929,14 @@ class Whisperapp:
                 )
 
             def request_summary(messages, max_tokens=None):
+                messages = self.with_summary_output_guard(messages)
                 if summary_backend == "Ollama CLI":
                     # Ollama CLIはmessagesを直接受け取らないため、プロンプト文字列に整形して標準入力で渡す
-                    prompt = self.build_ollama_prompt(messages)
+                    prompt = self.build_ollama_prompt(messages, ollama_model)
                     try:
-                        response = subprocess.run(
+                        response = self.run_cancellable_subprocess(
                             ["ollama", "run", ollama_model],
-                            input=prompt,
-                            capture_output=True,
-                            text=True,
-                            encoding="utf-8",
-                            errors="replace",
+                            input_text=prompt,
                             timeout=self.summary_timeout_seconds,
                         )
                     except subprocess.TimeoutExpired as e:
@@ -1556,9 +1953,12 @@ class Whisperapp:
                             f"{response.stderr.strip()}"
                         )
 
-                    content = response.stdout.strip()
+                    content = self.extract_summary_only(response.stdout)
                     if not content:
-                        raise RuntimeError("Ollama CLI から空の応答が返されました。")
+                        raise RuntimeError(
+                            "Ollama CLI から要約本文を抽出できませんでした。"
+                            "モデルが思考過程のみを返した可能性があります。"
+                        )
                     return content
 
                 request_params = {
@@ -1569,10 +1969,19 @@ class Whisperapp:
                 if max_tokens:
                     request_params["max_tokens"] = max_tokens
 
+                if client is None:
+                    raise RuntimeError("LM Studio クライアントが初期化されていません。")
+
                 response = client.chat.completions.create(
                     **request_params
                 )
-                return response.choices[0].message.content.strip()
+                content = self.extract_summary_only(response.choices[0].message.content)
+                if not content:
+                    raise RuntimeError(
+                        "LM Studio から要約本文を抽出できませんでした。"
+                        "モデルが思考過程のみを返した可能性があります。"
+                    )
+                return content
 
             # 分割要約を階層的に再分割して統合
             def make_summary_groups(summary_items, max_chars=None, max_items=None):
@@ -1791,7 +2200,7 @@ class Whisperapp:
 
     #要約結果をフォーマット
     def show_summary_result(self, summary): 
-        summary_text = summary.strip()
+        summary_text = self.extract_summary_only(summary)
         if self.privacy_mask_auto_var.get():
             summary_text, _ = self.mask_privacy_text(summary_text)
 
@@ -1883,6 +2292,7 @@ class Whisperapp:
                 messagebox.showerror("エラー", f"辞書の保存に失敗しました:\n{str(e)}")
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     root = ctk.CTk()
     app = Whisperapp(root)
     root.mainloop()
